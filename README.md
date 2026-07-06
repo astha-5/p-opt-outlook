@@ -7,7 +7,7 @@ Unit Commitment & Economic Dispatch, RPO compliance, scenario comparison, bankin
 and energy balance views, with XLSX export.
 
 ## Live site
-`https://astha-5.github.io/p-opt-uced/`
+`https://astha-5.github.io/p-opt-outlook/`
 
 ## Local development
 ```bash
