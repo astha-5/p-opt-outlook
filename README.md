@@ -1,9 +1,13 @@
-# P-OPT UCED Dashboard
+# P-OPT Outlook
 
-Unit Commitment & Economic Dispatch dashboard built with React + Recharts.
+(Formerly "P-OPT UCED Dashboard" — renamed as it evolved into a broader planning tool.)
+
+Energy dispatch and trading planning tool built with React + Recharts, covering
+Unit Commitment & Economic Dispatch, RPO compliance, scenario comparison, banking,
+and energy balance views, with XLSX export.
 
 ## Live site
-Once GitHub Pages is enabled: `https://astha-5.github.io/p-opt-uced/`
+`https://astha-5.github.io/p-opt-uced/`
 
 ## Local development
 ```bash

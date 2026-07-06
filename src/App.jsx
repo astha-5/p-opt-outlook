@@ -40,8 +40,8 @@ const C = {
   curtail: "#E91E63", panel: "#0B1D33",
   demandLine: "#FFFFFF", // demand reference line — must stay high-contrast on dark surfaces
 };
-const SEG_ORDER = ["Nuclear", "Thermal", "Gas", "Solar", "Wind", "Hydro", "BESS", "PSP", "Hybrid", "FDRE", "STOA", "DAM", "GDAM", "RTM"];
-const SEG_CLR = { Thermal: "#455A64", Solar: "#FFD600", Wind: "#2196F3", Hydro: "#00897B", BESS: "#E53935", PSP: "#8E24AA", Hybrid: "#00BFA5", FDRE: "#43A047", STOA: "#FF8F00", DAM: "#00ACC1", GDAM: "#7CB342", RTM: "#F06292", Nuclear: "#7E57C2", Gas: "#FF7043" };
+const SEG_ORDER = ["Nuclear", "Thermal", "Gas", "Solar", "Wind", "Hydro", "BESS", "PSP", "Hybrid", "FDRE", "STOA", "DAM", "GDAM", "RTM", "Charging"];
+const SEG_CLR = { Thermal: "#455A64", Solar: "#FFD600", Wind: "#2196F3", Hydro: "#00897B", BESS: "#E53935", PSP: "#8E24AA", Hybrid: "#00BFA5", FDRE: "#43A047", STOA: "#FF8F00", DAM: "#00ACC1", GDAM: "#7CB342", RTM: "#F06292", Nuclear: "#7E57C2", Gas: "#FF7043", Charging: "#D500F9" };
 // FC derives from SEG_CLR — single plant-type palette across grid rail, editors, legends, and charts
 const FC = { Thermal: SEG_CLR.Thermal, Solar: SEG_CLR.Solar, Wind: SEG_CLR.Wind, Hydro: SEG_CLR.Hydro, BESS: SEG_CLR.BESS, PSP: SEG_CLR.PSP, Hybrid: SEG_CLR.Hybrid, Market: C.dam, Nuclear: SEG_CLR.Nuclear, Gas: SEG_CLR.Gas };
 const FUEL_CLR = { coal_fsa: "#8D6E63", coal_auction: "#A1887F", coal_import: "#D7CCC8", gas_apm: "#FF7043", gas_spot: "#FF8A65", lignite: "#BCAAA4", nuclear: "#7E57C2", none: "#78909C" };
@@ -270,6 +270,9 @@ const REF96 = (() => {
 
 // Calendar-month indexed (Jan=0 ... Dec=11) — derived from the reference dataset
 const DEF_DEMAND = Array.from({ length: 12 }, (_, m) => REF96.demand[m] ? Math.round(Math.max(...REF96.demand[m])) : 2500);
+// Monthly energy (MU) implied by the reference demand blocks — displayed in the Demand editor.
+// While 96-block demand is loaded the engine uses the blocks directly (MU cell is read-only).
+const DEF_DEMAND_MU = Array.from({ length: 12 }, (_, m) => REF96.demand[m] ? +(REF96.demand[m].reduce((s, v) => s + v, 0) / 96 * 24 * CAL_DAYS[m] / 1000).toFixed(1) : 0);
 const avgOf96 = (arr) => +(arr.reduce((s, v) => s + v, 0) / 96).toFixed(2);
 const DEF_MKT = {
   // Calendar-month indexed (Jan=0 ... Dec=11) — MCPs derived from reference block data
@@ -311,11 +314,14 @@ const DEF_FDRE = [
 // const DEF_FUEL = { coal_fsa: {...}, coal_auction: {...}, ... };
 
 // Scenarios
+// demandSet: which uploaded demand forecast the scenario runs on ("base" | "high" | "low").
+// If the High/Low sheet isn't uploaded, the scenario falls back to Base × demMult.
 const DEF_SCENARIOS = [
-  { id: "base", name: "Base Case", demMult: 1.0, reMult: 1.0, priceMult: 1.0, fuelMult: 1.0, color: C.focus, active: true },
-  { id: "high_dem", name: "High Demand", demMult: 1.12, reMult: 0.95, priceMult: 1.15, fuelMult: 1.05, color: C.neg, active: true },
-  { id: "high_re", name: "High RE", demMult: 1.0, reMult: 1.25, priceMult: 0.85, fuelMult: 1.0, color: C.pos, active: true },
-  { id: "fuel_stress", name: "Fuel Stress", demMult: 1.05, reMult: 0.90, priceMult: 1.30, fuelMult: 1.40, color: C.warn, active: false },
+  { id: "base", name: "Base Case", demandSet: "base", demMult: 1.0, reMult: 1.0, priceMult: 1.0, fuelMult: 1.0, color: C.focus, active: true },
+  { id: "high_dem", name: "High Demand", demandSet: "high", demMult: 1.12, reMult: 0.95, priceMult: 1.15, fuelMult: 1.05, color: C.neg, active: true },
+  { id: "low_dem", name: "Low Demand", demandSet: "low", demMult: 0.92, reMult: 1.05, priceMult: 0.90, fuelMult: 1.0, color: C.info, active: true },
+  { id: "high_re", name: "High RE", demandSet: "base", demMult: 1.0, reMult: 1.25, priceMult: 0.85, fuelMult: 1.0, color: C.pos, active: true },
+  { id: "fuel_stress", name: "Fuel Stress", demandSet: "base", demMult: 1.05, reMult: 0.90, priceMult: 1.30, fuelMult: 1.40, color: C.warn, active: false },
 ];
 
 // ══════════════════════════════════════════════════════════════
@@ -327,13 +333,14 @@ function fdreProfile96(fdre, mi) {
   return Array.from({ length: 96 }, (_, t) => {
     const h = t / 4;
     if (fdre.profile === "RTC") return Math.round(fdre.capacity * cuf);
+    // Delivery capped at contracted capacity (audit P1-2 fix: CUF spread over a short window could exceed capacity)
     if (fdre.profile === "PEAK") {
       const ds = fdre.deliveryStart || 8, de = fdre.deliveryEnd || 18;
-      return (h >= ds && h < de) ? Math.round(fdre.capacity * cuf * 24 / (de - ds)) : 0;
+      return (h >= ds && h < de) ? Math.min(fdre.capacity, Math.round(fdre.capacity * cuf * 24 / (de - ds))) : 0;
     }
     if (fdre.profile === "CUSTOM") {
       const ds = fdre.deliveryStart || 0, de = fdre.deliveryEnd || 24;
-      return (h >= ds && h < de) ? Math.round(fdre.capacity * cuf * 24 / (de - ds)) : 0;
+      return (h >= ds && h < de) ? Math.min(fdre.capacity, Math.round(fdre.capacity * cuf * 24 / (de - ds))) : 0;
     }
     return Math.round(fdre.capacity * cuf);
   });
@@ -372,11 +379,11 @@ function computeRPO(allRes, plants, stoa, fdre, rpo, mkt) {
   ful.total = +(ful.solar + ful.nonSolar + ful.hydro + ful.eso).toFixed(1);
   const pct = { solar: +(solMU / totMU * 100).toFixed(1), nonSolar: +(wndMU / totMU * 100).toFixed(1), hydro: +(hydMU / totMU * 100).toFixed(1), eso: +(esoMU / totMU * 100).toFixed(1) };
   const sh = { solar: +Math.max(0, tgt.solar - ful.solar).toFixed(1), nonSolar: +Math.max(0, tgt.nonSolar - ful.nonSolar).toFixed(1), hydro: +Math.max(0, tgt.hydro - ful.hydro).toFixed(1), eso: +Math.max(0, tgt.eso - ful.eso).toFixed(1) };
-  // Use mkt REC prices (Rs/kWh) → Rs/MWh * 1000 → Cr / 100000. Shortfall in MU (= GWh), so MU * Rs/kWh * 1000 / 100000 = MU * Rs/kWh / 100
+  // REC cost: shortfall MU × REC ₹/kWh → 1 MU = 10⁶ kWh → ₹ = MU·rec·10⁶ → Cr = MU·rec/10 (audit P1-1 fix: was /100, 10× understated)
   const recSolar = (mkt && mkt.recSolarPrice) || rpo.recPriceSolar / 1000 || 2.0;
   const recNonSolar = (mkt && mkt.recNonSolarPrice) || rpo.recPriceNonSolar / 1000 || 1.5;
   const recHydro = rpo.recPriceHydro / 1000 || 1.0;
-  const rc = { solar: +(sh.solar * recSolar / 100).toFixed(2), nonSolar: +(sh.nonSolar * recNonSolar / 100).toFixed(2), hydro: +(sh.hydro * recHydro / 100).toFixed(2) };
+  const rc = { solar: +(sh.solar * recSolar / 10).toFixed(2), nonSolar: +(sh.nonSolar * recNonSolar / 10).toFixed(2), hydro: +(sh.hydro * recHydro / 10).toFixed(2) };
   rc.total = +(rc.solar + rc.nonSolar + rc.hydro).toFixed(2);
   return { totMU, targets: tgt, fulfilled: ful, pct, shortfall: sh, recCost: rc, fdreMU: +fdrMU.toFixed(1) };
 }
@@ -394,10 +401,13 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
   const fuelMult = scenarioMult.fuelMult || 1.0;
   const noise = scenarioMult.noise || 0;
 
-  // Demand: uploaded 96-block > peak+energy calibrated shape > peak-scaled shape
+  // Demand: scenario forecast sheet (base/high/low) > base 96-block > peak+energy calibrated shape > peak-scaled shape
+  // scenarioMult.demandSet ∈ {"base","high","low"} picks the uploaded forecast; missing sheets fall back to base.
   let dem;
-  if (blockData && blockData.demand && blockData.demand[mi]) {
-    dem = blockData.demand[mi].map(v => Math.round(v * demMult));
+  const demKey = scenarioMult.demandSet === "high" ? "demandHigh" : scenarioMult.demandSet === "low" ? "demandLow" : "demand";
+  const demBlocks = blockData ? (blockData[demKey]?.[mi] || blockData.demand?.[mi]) : null;
+  if (demBlocks) {
+    dem = demBlocks.map(v => Math.round(v * demMult));
   } else if (energyMU > 0 && (basePeak || peakMW) > 0) {
     // Calibrate shape to hit BOTH monthly peak and monthly energy (MU):
     // power transform d = peak·(s/sMax)^γ, γ solved by bisection so mean(d) = MU·1000/(days·24).
@@ -458,12 +468,18 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
       const mw = Math.round(s.mw * lf);
       if (s.seg === "Banking") totalBank += mw; else totalBilat += mw;
     });
-    return Math.min(totalBilat, bilatLim) + Math.min(totalBank, bankLim);
+    return { bilat: Math.min(totalBilat, bilatLim), bank: Math.min(totalBank, bankLim) };
   };
   const stoaAvgRate = (() => {
     const buys = activeSTOA.filter(s => s.dir === "BUY");
     const totalMW = safeSum(buys, "mw");
     return totalMW > 0 ? safeSum(buys, s => s.mw * s.rate) / totalMW : 0;
+  })();
+  // Bilateral SELL rate (MW-weighted) — banking injections earn nothing (energy is stored, not sold)
+  const stoaSellRate = (() => {
+    const sells = activeSTOA.filter(s => s.dir === "SELL" && s.seg !== "Banking");
+    const totalMW = safeSum(sells, "mw");
+    return totalMW > 0 ? safeSum(sells, s => s.mw * s.rate) / totalMW : 0;
   })();
 
   // ── Market rates ──
@@ -495,15 +511,18 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
   // ════════════════════════════════════════════════════════════
   const netResidual = Array(96).fill(0);
   const stoaBuy96 = Array(96).fill(0);
-  const stoaSell96 = Array(96).fill(0);
+  const stoaSellB96 = Array(96).fill(0); // bilateral SELL (earns contract rate)
+  const stoaSellK96 = Array(96).fill(0); // banking inject (no revenue — stored)
   const margCostEst = Array(96).fill(0);
 
   for (let t = 0; t < 96; t++) {
     let residual = dem[t];
     activePlants.forEach(p => { if (re[p.id] != null) residual -= (re[p.id][t] || 0); });
     residual -= (fdreTotal96[t] || 0);
-    stoaBuy96[t] = computeSTOA(t, "BUY");
-    stoaSell96[t] = computeSTOA(t, "SELL");
+    const buyO = computeSTOA(t, "BUY");
+    stoaBuy96[t] = buyO.bilat + buyO.bank;
+    const sellO = computeSTOA(t, "SELL");
+    stoaSellB96[t] = sellO.bilat; stoaSellK96[t] = sellO.bank;
     residual -= stoaBuy96[t];
     netResidual[t] = residual;
 
@@ -511,7 +530,7 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
     let mc = damRate;
     let cumCap = 0;
     for (const p of thermals) {
-      const av = Math.round(p.pMax * effAvail(p, mi) / 100);
+      const av = Math.floor(p.pMax * effAvail(p, mi) / 100); // floor: never round INTO capacity that isn't available
       cumCap += av;
       if (cumCap >= residual) { mc = p.ecr * fuelMult; break; }
     }
@@ -526,10 +545,15 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
   //  BESS acts as demand point when absorbing surplus (shifts MC in Pass 3)
   // ════════════════════════════════════════════════════════════
   const totalThermalPmin = safeSum(thermals, p => effAvail(p, mi) > 0 ? (p.pMin || Math.round(p.pMax * 0.3)) : 0);
-  const totalThermalCap = safeSum(thermals, p => Math.round(p.pMax * effAvail(p, mi) / 100));
+  const totalThermalCap = safeSum(thermals, p => Math.floor(p.pMax * effAvail(p, mi) / 100));
   const damPrice96 = Array.from({ length: 96 }, (_, t) => bd.dam?.[mi]?.[t] != null ? bd.dam[mi][t] * priceMult : damRate);
-  const cheapestOwnECR = thermals.length > 0 ? Math.min(...thermals.map(p => p.ecr * fuelMult)) : damRate;
-  const costliestOwnECR = thermals.length > 0 ? Math.max(...thermals.map(p => p.ecr * fuelMult)) : 0;
+  const gdamPrice96 = Array.from({ length: 96 }, (_, t) => bd.gdam?.[mi]?.[t] != null ? bd.gdam[mi][t] * priceMult : gdamRate);
+  const rtmPrice96 = Array.from({ length: 96 }, (_, t) => bd.rtm?.[mi]?.[t] != null ? bd.rtm[mi][t] * priceMult : rtmRate);
+  // Price-spread arbitrage thresholds: P25 / P75 of the day's DAM block curve.
+  // (Previously compared market price to cheapest/costliest OWN ECR — degenerate with a real
+  // portfolio spanning 0-VC must-run to ₹34 spot gas: neither threshold could ever trigger.)
+  const damSorted = [...damPrice96].sort((a, b) => a - b);
+  const priceP25 = damSorted[24], priceP75 = damSorted[71];
 
   const storSchedule = {}; // storSchedule[plantId][t] = MW (+ve discharge, -ve charge)
   stor.forEach(p => {
@@ -540,13 +564,16 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
     const maxCycles = p.cycles || (p.type === "BESS" ? 1 : 99);
     const cycleBudgetMWh = maxCycles * cap;
     const eAstor = effAvail(p, mi) / 100; // outage-calendar derating
-    const maxChargeRate = Math.round((p.maxChargeRate || p.pMax) * eAstor); // configurable, defaults to pMax
-    const maxDischargeRate = Math.round(p.pMax * eAstor);
+    const maxChargeRate = Math.floor((p.maxChargeRate || p.pMax) * eAstor); // configurable, defaults to pMax
+    const maxDischargeRate = Math.floor(p.pMax * eAstor);
     const rampUpMW = (p.rampUp || 999) * 15; // MW per 15-min block
     const rampDnMW = (p.rampDn || p.rampUp || 999) * 15;
     const transBlocks = Math.ceil((p.transitionMins || 0) / 15); // blocks needed for charge↔discharge transition
+    // Arbitrage viable only if selling at P75 (net of round-trip losses) beats buying at P25 plus degradation
+    const degradArb = p.degradCost || 0;
+    const arbViable = priceP75 * eff - priceP25 > degradArb + 0.1;
 
-    // Classify each block by surplus/deficit and market opportunity
+    // Classify each block by surplus/deficit and price-spread opportunity
     const blockClass = Array.from({ length: 96 }, (_, t) => {
       const nr = netResidual[t];
       const mktPrice = damPrice96[t];
@@ -557,8 +584,8 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
       return { t, nr, mktPrice, surplusMW, deficitMW,
         isSurplus: surplusMW > 0,
         isDeficit: deficitMW > 0,
-        mktCheap: mktPrice < cheapestOwnECR,
-        mktExpensive: mktPrice > costliestOwnECR && costliestOwnECR > 0 };
+        mktCheap: arbViable && mktPrice <= priceP25,
+        mktExpensive: arbViable && mktPrice >= priceP75 };
     });
 
     // Discharge candidates: (P0) deficit blocks by deficit desc, (P1) expensive-market blocks by price desc
@@ -713,7 +740,6 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
 
   for (let t = 0; t < 96; t++) {
     const d = dem[t]; let rem = d; const src = {}; let gen = 0; let chargingLoad = 0;
-    let curtailment = 0;
 
     // 1) Must-run RE + Nuclear
     activePlants.forEach(p => {
@@ -727,14 +753,8 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
     // 1.5) FDRE
     const fdreMW = fdreTotal96[t] || 0;
     rem -= fdreMW;
-
-    // Curtailment check
-    const minThermalLoad = safeSum(thermals.filter(p => commitState[p.id]?.on > 0), "pMin");
-    if (rem < -minThermalLoad * 0.5) {
-      curtailment = Math.abs(rem) - minThermalLoad * 0.3;
-      if (curtailment < 0) curtailment = 0;
-      totalCurtailment += curtailment;
-    }
+    // (Curtailment is now computed post-dispatch as UNSOLD surplus — audit P1-5 fix,
+    //  replacing the pre-dispatch magic-threshold estimate that double-counted with surplus revenue.)
 
     // 2) Execute pre-computed storage schedule
     stor.forEach(p => {
@@ -779,18 +799,23 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
 
     // 3) STOA + Thermal merit order
     const sBuy = stoaBuy96[t];
-    const sSell = stoaSell96[t];
     const meritSlots = [];
     if (sBuy > 0) meritSlots.push({ type: "STOA", mw: sBuy, cost: stoaAvgRate });
     thermals.forEach(p => meritSlots.push({ type: "THERMAL", plant: p, cost: p.ecr * fuelMult }));
+    // Market segments compete in the merit order at BLOCK prices (economy purchase), capped by segment limits.
+    // A cheap DAM block therefore displaces costlier own thermal down to its commitment floor.
+    meritSlots.push({ type: "MKT", seg: "DAM", lim: damLim, cost: damPrice96[t] });
+    meritSlots.push({ type: "MKT", seg: "GDAM", lim: gdamLim, cost: gdamPrice96[t] });
+    meritSlots.push({ type: "MKT", seg: "RTM", lim: rtmLim, cost: rtmPrice96[t] });
     meritSlots.sort((a, b) => a.cost - b.cost);
 
     let stoaUsed = 0; let startCostBlock = 0;
+    let mktDAM = 0, mktGDAM = 0, mktRTM = 0;
     meritSlots.forEach(slot => {
       if (rem <= 0) {
         if (slot.type === "THERMAL") {
           const p = slot.plant;
-          const avX = Math.round(p.pMax * effAvail(p, mi) / 100);
+          const avX = Math.floor(p.pMax * effAvail(p, mi) / 100);
           // Must-run at pMin if still within minimum uptime
           if (avX > 0 && commitState[p.id].on > 0 && commitState[p.id].on < (p.minUp || 1) * 4) {
             const dp = Math.min(p.pMin, avX);
@@ -826,9 +851,15 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
       if (slot.type === "STOA") {
         const used = Math.min(sBuy, rem);
         stoaUsed = used; rem -= used;
+      } else if (slot.type === "MKT") {
+        const buy = Math.round(Math.min(slot.lim, rem));
+        if (buy > 0) {
+          if (slot.seg === "DAM") mktDAM += buy; else if (slot.seg === "GDAM") mktGDAM += buy; else mktRTM += buy;
+          rem -= buy;
+        }
       } else {
         const p = slot.plant;
-        const av = Math.round(p.pMax * effAvail(p, mi) / 100);
+        const av = Math.floor(p.pMax * effAvail(p, mi) / 100);
         if (commitState[p.id].off > 0 && commitState[p.id].off < (p.minDn || 1) * 4) {
           src[p.id] = { id: p.id, n: p.name, tp: p.type, mw: 0, ecr: p.ecr * fuelMult, st: "MIN-DN", fuel: p.fuel || "none" };
           commitState[p.id].off++;
@@ -865,19 +896,22 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
     });
     thermals.forEach(p => { if (!src[p.id]) { src[p.id] = { id: p.id, n: p.name, tp: p.type, mw: 0, ecr: p.ecr * fuelMult, st: "STANDBY", fuel: p.fuel || "none" }; prevMW[p.id] = 0; } });
 
-    // 4) Surplus/Deficit from own generation vs demand (before market)
-    // rem < 0 means own-gen > demand → surplus; rem > 0 means shortfall → deficit
-    // STOA sell: only possible from surplus, capped at available surplus
+    // 4) Surplus / unserved after merit dispatch (market already purchased in merit order above)
+    // rem > 0 here means ALL segment limits are exhausted → genuinely unserved energy
+    // STOA sell from surplus: bilateral sale first (earns contract rate — audit P1-3 fix), banking inject next (stored, no revenue)
     const ownSurplus = Math.max(0, -rem);
-    const actualStoaSell = Math.min(sSell, ownSurplus);
+    const stoaSellBilat = Math.min(stoaSellB96[t], ownSurplus);
+    const stoaSellBank = Math.min(stoaSellK96[t], ownSurplus - stoaSellBilat);
+    const actualStoaSell = stoaSellBilat + stoaSellBank;
     rem += actualStoaSell; // STOA sell consumes part of surplus
-    const deficit = Math.max(0, rem);
-    const surplus = Math.max(0, -rem); // remaining surplus after STOA sell
-    let mktDAM = 0, mktGDAM = 0, mktRTM = 0, mktRemain = deficit;
-    if (mktRemain > 0) { mktDAM = Math.min(mktRemain, damLim); mktRemain -= mktDAM; }
-    if (mktRemain > 0) { mktGDAM = Math.min(mktRemain, gdamLim); mktRemain -= mktGDAM; }
-    if (mktRemain > 0) { mktRTM = Math.min(mktRemain, rtmLim); mktRemain -= mktRTM; }
-    const mktTotal = mktDAM + mktGDAM + mktRTM + mktRemain;
+    const unserved = Math.max(0, rem);
+    const surplusTotal = Math.max(0, -rem);            // physical surplus after STOA sell
+    const sellable = Math.min(surplusTotal, damLim);   // market sale capped by DAM segment limit (audit N1 fix)
+    const curtailment = surplusTotal - sellable;       // unsold surplus = spilled/curtailed, earns nothing
+    totalCurtailment += curtailment;
+    const surplus = sellable;                          // reported surplus = SOLD surplus
+    const deficit = mktDAM + mktGDAM + mktRTM + unserved; // total shortfall vs own gen (market-covered + unserved)
+    const mktTotal = mktDAM + mktGDAM + mktRTM; // actual purchases only — unserved reported separately
 
     // 5) Cost calculation (₹ lakhs per 15-min block)
     const blockHrs = 0.25;
@@ -893,22 +927,23 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
     });
     varCost += fdreMW * fdreAvgRate * blockHrs * 10 / 1000;
     varCost += stoaUsed * stoaAvgRate * blockHrs * 10 / 1000;
-    varCost += mktDAM * damRate * blockHrs * 10 / 1000;
-    varCost += mktGDAM * gdamRate * blockHrs * 10 / 1000;
-    varCost += mktRTM * rtmRate * blockHrs * 10 / 1000;
+    varCost += mktDAM * damPrice96[t] * blockHrs * 10 / 1000;
+    varCost += mktGDAM * gdamPrice96[t] * blockHrs * 10 / 1000;
+    varCost += mktRTM * rtmPrice96[t] * blockHrs * 10 / 1000;
 
-    // Surplus sale revenue (100% of surplus sold at DAM rate)
-    const surplusRevenue = surplus > 0 ? surplus * damRate * blockHrs * 10 / 1000 : 0;
-    const blockCost = varCost + startCostBlock / 1000 - surplusRevenue;
+    // Sale revenues: market surplus at block DAM (capped above), bilateral STOA sale at contract rate
+    const surplusRevenue = surplus > 0 ? surplus * damPrice96[t] * blockHrs * 10 / 1000 : 0;
+    const stoaSellRevenue = stoaSellBilat > 0 ? stoaSellBilat * stoaSellRate * blockHrs * 10 / 1000 : 0;
+    const blockCost = varCost + startCostBlock / 1000 - surplusRevenue - stoaSellRevenue;
 
     blks.push({
       t, lbl: TB[t].lbl, dem: d, src, gen, chg: chargingLoad,
-      def: deficit, sur: surplus, curtailment: Math.round(curtailment),
+      def: deficit, sur: surplus, unserved, curtailment: Math.round(curtailment),
       fdreMW, fdreRate: fdreAvgRate,
       stoaBuy: stoaUsed, stoaSell: actualStoaSell, stoaRate: stoaAvgRate,
       mkt: mktTotal, mktDAM, mktGDAM: mktGDAM || 0, mktRTM, mktSell: surplus,
-      damRate, rtmRate, gdamRate,
-      varCost: +varCost.toFixed(2), fixedCost: +fixedCostPerBlock.toFixed(3), surRevenue: +surplusRevenue.toFixed(2),
+      damRate: +damPrice96[t].toFixed(2), rtmRate: +rtmPrice96[t].toFixed(2), gdamRate: +gdamPrice96[t].toFixed(2),
+      varCost: +varCost.toFixed(2), fixedCost: +fixedCostPerBlock.toFixed(3), surRevenue: +surplusRevenue.toFixed(2), stoaSellRev: +stoaSellRevenue.toFixed(2),
       startCost: startCostBlock,
       cost: +blockCost.toFixed(2),
       margCost: +margCostEst[t].toFixed(2),
@@ -942,6 +977,7 @@ function aggHourly(b96) {
     hrs.push({
       h, lbl: `${String(h).padStart(2, "0")}:00`,
       dem: Math.round(safeMean(s, "dem")), gen: Math.round(safeMean(s, "gen")),
+      chg: Math.round(safeMean(s, b => b.chg || 0)),
       def: Math.round(safeMean(s, "def")), sur: Math.round(safeMean(s, "sur")),
       curtailment: Math.round(safeSum(s, "curtailment")),
       mkt: Math.round(safeMean(s, "mkt")),
@@ -1031,6 +1067,7 @@ const NAV = [
   { id: "grid", label: "96-Block", icon: "M3 3h4v4H3zm7 0h4v4h-4zm7 0h4v4h-4zM3 10h4v4H3zm7 0h4v4h-4zm7 0h4v4h-4zM3 17h4v4H3zm7 0h4v4h-4zm7 0h4v4h-4z" },
   { id: "dispatch", label: "Dispatch", icon: "M4 20h16V4H4v16zm2-7h3v5H6v-5zm5 0h3v5h-3v-5zm5-4h3v9h-3V9z" },
   { id: "market", label: "Market", icon: "M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zm0-10v2h14V7H7z" },
+  { id: "banking", label: "Banking", icon: "M6.99 11L3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z" },
   { id: "rpo", label: "RPO", icon: "M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z" },
   { id: "scenarios", label: "Scenarios", icon: "M14 6l-3.75 5 2.85 3.8-1.6 1.2C9.81 13.75 7 10 7 10l-6 8h22l-9-12z" },
   { id: "balance", label: "Balance", icon: "M12 3v10.55A4 4 0 1014 17V7h4V3h-6z" },
@@ -1124,7 +1161,7 @@ function PlantEditor({ plants, setPlants }) {
       <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2, maxHeight: 400 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr>
-            {["", "Name", "Type", "Fuel", "From", "PMax", "PMin", "ECR ₹/kWh", "Fixed ₹/MW/mo", "Start ₹L", "Avail%", "Must", "Ramp Up", "Ramp Dn", "MinUp", "MinDn", "MWh", "Eff%", "Deg₹", "Cyc/StoHr", "Trans", "Pondage"].map((h, i) => (
+            {["", "Name", "Type", "Fuel", "From", "PMax", "PMin", "TM %", "ECR ₹/kWh", "Fixed ₹/MW/mo", "Start ₹L", "Avail%", "Must", "Ramp Up", "Ramp Dn", "MinUp", "MinDn", "Pondage"].map((h, i) => (
               <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "7px 5px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 4 ? "right" : "left", position: "sticky", top: 0, zIndex: 1, whiteSpace: "nowrap" }}>{h}</th>
             ))}
           </tr></thead>
@@ -1152,6 +1189,11 @@ function PlantEditor({ plants, setPlants }) {
               </td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.pMax} onChange={v => update(p.id, "pMax", v)} type="number" min={0} width={40} /></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.pMin} onChange={v => update(p.id, "pMin", v)} type="number" min={0} width={35} /></td>
+              <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right", background: C.dec + "0C" }}>
+                {(p.type === "Thermal" || p.type === "Gas" || p.type === "Nuclear") ? (
+                  <EditCell value={p.pMax > 0 ? Math.round((p.pMin || 0) / p.pMax * 100) : 0} onChange={v => update(p.id, "pMin", Math.round(p.pMax * v / 100))} type="number" min={0} max={100} width={30} />
+                ) : <span style={{ ...mono, fontSize: 9, color: C.t3 }}>—</span>}
+              </td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right", background: (p.ecr || 0) < 2.5 ? C.pos + "18" : (p.ecr || 0) < 4 ? C.warn + "15" : C.neg + "15" }}><EditCell value={p.ecr} onChange={v => update(p.id, "ecr", v)} type="number" min={0} width={40} /></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.fixedCost || 0} onChange={v => update(p.id, "fixedCost", v)} type="number" min={0} width={45} /></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.startCost || 0} onChange={v => update(p.id, "startCost", v)} type="number" min={0} width={30} /></td>
@@ -1163,23 +1205,6 @@ function PlantEditor({ plants, setPlants }) {
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.rampDn || p.rampUp || 0} onChange={v => update(p.id, "rampDn", v)} type="number" min={0} width={30} /></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.minUp || 0} onChange={v => update(p.id, "minUp", v)} type="number" min={0} width={25} /></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.minDn || 0} onChange={v => update(p.id, "minDn", v)} type="number" min={0} width={25} /></td>
-              <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.mwh || "—"} onChange={v => update(p.id, "mwh", v)} type="number" min={0} disabled={p.type !== "BESS" && p.type !== "PSP"} width={35} /></td>
-              <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.eff || "—"} onChange={v => update(p.id, "eff", v)} type="number" min={0} max={100} disabled={p.type !== "BESS" && p.type !== "PSP"} width={30} /></td>
-              <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.degradCost || "—"} onChange={v => update(p.id, "degradCost", v)} type="number" min={0} disabled={!isStor(p)} width={30} /></td>
-              <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
-                {p.type === "BESS" ? (
-                  <select value={p.cycles || 1} onChange={e => update(p.id, "cycles", parseInt(e.target.value))} style={{ ...ui, fontSize: 9, background: C.overlay, color: C.t1, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 2px", cursor: "pointer", width: 36 }}>
-                    {[1, 1.5, 2, 2.5, 3].map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                ) : (isStor(p) || isHydro(p)) ? (
-                  <EditCell value={p.storageHrs || 0} onChange={v => update(p.id, "storageHrs", v)} type="number" min={0} max={24} width={30} />
-                ) : <span style={{ ...mono, fontSize: 9, color: C.t3 }}>—</span>}
-              </td>
-              <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
-                {(isStor(p) || (isHydro(p) && p.pondage === "with")) ? (
-                  <EditCell value={p.transitionMins || 0} onChange={v => update(p.id, "transitionMins", v)} type="number" min={0} max={60} width={25} />
-                ) : <span style={{ ...mono, fontSize: 9, color: C.t3 }}>—</span>}
-              </td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15` }}>
                 {isHydro(p) ? (
                   <select value={p.pondage || "without"} onChange={e => update(p.id, "pondage", e.target.value)} style={{ ...ui, fontSize: 9, background: C.overlay, color: p.pondage === "with" ? C.pos : C.t2, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 2px", cursor: "pointer", minWidth: 48 }}>
@@ -1192,6 +1217,82 @@ function PlantEditor({ plants, setPlants }) {
           ))}</tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  STORAGE EDITOR — dedicated parameters for BESS / PSP / pondage hydro
+//  (power & energy ratings, SoC band, cycles, efficiency, transition, degradation)
+// ══════════════════════════════════════════════════════════════
+function StorageEditor({ plants, setPlants }) {
+  const stor = plants.filter(p => p.type === "BESS" || p.type === "PSP" || (p.type === "Hydro" && p.pondage === "with"));
+  const update = (id, key, val) => setPlants(prev => prev.map(p => p.id === id ? { ...p, [key]: val } : p));
+  const delStor = (id) => setPlants(prev => prev.filter(p => p.id !== id));
+  const addStor = (tp) => {
+    const id = Math.max(0, ...plants.map(p => p.id)) + 1;
+    const base = tp === "BESS"
+      ? { id, name: `BESS ${id}`, type: "BESS", fuel: "none", pMax: 100, pMin: 0, ecr: 0, fixedCost: 0, startCost: 0, avail: 95, mustRun: false, rampUp: 100, rampDn: 100, minUp: 0, minDn: 0, mwh: 400, eff: 88, socMin: 10, socMax: 90, cycles: 1, transitionMins: 5, degradCost: 0.5 }
+      : { id, name: `PSP ${id}`, type: "PSP", fuel: "none", pMax: 200, pMin: 0, ecr: 0, fixedCost: 0, startCost: 0, avail: 90, mustRun: false, rampUp: 30, rampDn: 30, minUp: 2, minDn: 2, mwh: 1200, eff: 78, socMin: 5, socMax: 95, storageHrs: 6, transitionMins: 15, degradCost: 0.1 };
+    setPlants(prev => [...prev, base]);
+  };
+  const capOf = (p) => p.mwh || (p.type === "Hydro" ? (p.storageHrs || 6) * p.pMax : 0);
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+        <button onClick={() => addStor("BESS")} style={{ ...lbl, fontSize: 10, padding: "3px 10px", background: SEG_CLR.BESS + "15", color: SEG_CLR.BESS, border: `1px solid ${SEG_CLR.BESS}33`, borderRadius: 2, cursor: "pointer" }}>+ ADD BESS</button>
+        <button onClick={() => addStor("PSP")} style={{ ...lbl, fontSize: 10, padding: "3px 10px", background: SEG_CLR.PSP + "15", color: SEG_CLR.PSP, border: `1px solid ${SEG_CLR.PSP}33`, borderRadius: 2, cursor: "pointer" }}>+ ADD PSP</button>
+        <span style={{ ...mono, fontSize: 10, color: C.t3, marginLeft: "auto" }}>Charges on surplus / cheap-market blocks, discharges on deficit / expensive blocks — cycle- &amp; SoC-limited</span>
+      </div>
+      {stor.length === 0 ? (
+        <div style={{ ...ui, fontSize: 11, color: C.t3, padding: 12, textAlign: "center", border: `1px dashed ${C.brd}`, borderRadius: 3 }}>
+          No storage assets in the portfolio (the BRPL PLM carries TEHRI_PSP at 0 PPA MW). Add a BESS or PSP above — units created here get proper storage defaults.
+        </div>
+      ) : (
+        <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr>
+              {["", "Name", "Type", "Power MW", "Charge MW", "Energy MWh", "Hrs", "RT Eff %", "SoC Min %", "SoC Max %", "Cycles/day", "Trans min", "Degrad ₹/kWh", "Avail %"].map((h, i) => (
+                <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "6px 5px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 2 ? "right" : "left", whiteSpace: "nowrap" }}>{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>{stor.map((p, ri) => {
+              const cap = capOf(p);
+              const isHyd = p.type === "Hydro";
+              return (
+                <tr key={p.id} style={{ background: ri % 2 === 0 ? C.elev : C.elev + "99" }}>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15` }}><button onClick={() => delStor(p.id)} style={{ background: "none", border: "none", color: C.neg, cursor: "pointer", fontSize: 12 }}>x</button></td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15` }}><EditCell value={p.name} onChange={v => update(p.id, "name", v)} type="text" width={90} /></td>
+                  <td style={{ ...ui, fontSize: 10, padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, color: FC[p.type] || C.t1 }}>{isHyd ? "Hydro (pondage)" : p.type}</td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.pMax} onChange={v => update(p.id, "pMax", v)} type="number" min={0} width={40} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.maxChargeRate || p.pMax} onChange={v => update(p.id, "maxChargeRate", v)} type="number" min={0} width={40} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
+                    {isHyd ? <span style={{ ...mono, fontSize: 11, color: C.t2 }} title="Derived: storage hrs × MW">{cap}</span>
+                      : <EditCell value={p.mwh || 0} onChange={v => update(p.id, "mwh", v)} type="number" min={0} width={40} />}
+                  </td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
+                    {isHyd ? <EditCell value={p.storageHrs || 6} onChange={v => update(p.id, "storageHrs", v)} type="number" min={0} max={24} width={30} />
+                      : <span style={{ ...mono, fontSize: 10, color: C.t3 }}>{p.pMax > 0 ? (cap / p.pMax).toFixed(1) : "—"}</span>}
+                  </td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.eff || (isHyd ? 90 : 85)} onChange={v => update(p.id, "eff", v)} type="number" min={1} max={100} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.socMin ?? 5} onChange={v => update(p.id, "socMin", v)} type="number" min={0} max={100} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.socMax ?? 95} onChange={v => update(p.id, "socMax", v)} type="number" min={0} max={100} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
+                    {p.type === "BESS" ? (
+                      <select value={p.cycles || 1} onChange={e => update(p.id, "cycles", parseFloat(e.target.value))} style={{ ...ui, fontSize: 10, background: C.overlay, color: C.t1, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 2px", cursor: "pointer", width: 42 }}>
+                        {[1, 1.5, 2, 2.5, 3].map(c => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                    ) : <span style={{ ...mono, fontSize: 10, color: C.t3 }} title="Unlimited">∞</span>}
+                  </td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.transitionMins || 0} onChange={v => update(p.id, "transitionMins", v)} type="number" min={0} max={60} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.degradCost || 0} onChange={v => update(p.id, "degradCost", v)} type="number" min={0} width={35} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.avail ?? 95} onChange={v => update(p.id, "avail", v)} type="number" min={0} max={100} width={30} /></td>
+                </tr>
+              );
+            })}</tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -1251,25 +1352,26 @@ function OutageEditor({ plants, setPlants, moNames, months }) {
   );
 }
 
-function DemandEditor({ demand, setDemand, demandMU, setDemandMU, moNames, months }) {
+function DemandEditor({ demand, setDemand, demandMU, setDemandMU, moNames, months, uploaded96 }) {
   return (
     <div>
       <div style={{ ...mono, fontSize: 10, color: C.t3, marginBottom: 6 }}>
-        Peak MW + optional Energy MU per month. When MU is set, the demand shape is calibrated to hit both peak and energy (implied LF shown). MU = 0 → shape default.
+        Peak MW + Energy MU per month. Months backed by 96-block data show their actual MU (read-only, tagged 96B). Without block data, setting MU calibrates the demand shape to hit both peak and energy. MU = 0 → shape default.
       </div>
       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
         {moNames.map((m, i) => {
           const cal = months[i].cal;
           const pk = demand[cal] || 0;
           const mu = (demandMU && demandMU[cal]) || 0;
+          const fromBlocks = !!(uploaded96 && uploaded96.demand && uploaded96.demand[cal]);
           const lf = pk > 0 && mu > 0 ? mu * 1000 / (months[i].days * 24 * pk) * 100 : 0;
-          const lfBad = lf > 0 && (lf < 30 || lf > 98);
+          const lfBad = !fromBlocks && lf > 0 && (lf < 30 || lf > 98);
           return (
             <div key={i} style={{ background: C.elev, border: `1px solid ${C.brd}`, borderRadius: 5, padding: "6px 10px", textAlign: "center", minWidth: 78 }}>
               <div style={{ ...ui, fontSize: 11, color: C.t2, marginBottom: 4 }}>{m} <span style={{ ...mono, fontSize: 9, color: C.t3 }}>{months[i].days}d</span></div>
-              <div><EditCell value={pk} onChange={v => { const d = [...demand]; d[cal] = v; setDemand(d); }} type="number" min={0} width={55} /><span style={{ ...mono, fontSize: 9, color: C.t3 }}> MW</span></div>
-              <div style={{ marginTop: 2 }}><EditCell value={mu} onChange={v => { const d = [...(demandMU || Array(12).fill(0))]; d[cal] = v; setDemandMU(d); }} type="number" min={0} width={55} /><span style={{ ...mono, fontSize: 9, color: C.t3 }}> MU</span></div>
-              <div style={{ ...mono, fontSize: 9, color: lfBad ? C.neg : mu > 0 ? C.pos : C.t3, marginTop: 2 }}>{mu > 0 ? `LF ${lf.toFixed(0)}%${lfBad ? " !" : ""}` : "LF auto"}</div>
+              <div><EditCell value={pk} onChange={v => { const d = [...demand]; d[cal] = v; setDemand(d); }} type="number" min={0} width={55} disabled={fromBlocks} /><span style={{ ...mono, fontSize: 9, color: C.t3 }}> MW</span></div>
+              <div style={{ marginTop: 2 }}><EditCell value={mu} onChange={v => { const d = [...(demandMU || Array(12).fill(0))]; d[cal] = v; setDemandMU(d); }} type="number" min={0} width={55} disabled={fromBlocks} /><span style={{ ...mono, fontSize: 9, color: C.t3 }}> MU</span></div>
+              <div style={{ ...mono, fontSize: 9, color: lfBad ? C.neg : mu > 0 ? C.pos : C.t3, marginTop: 2 }}>{mu > 0 ? `LF ${lf.toFixed(0)}%${lfBad ? " !" : ""}` : "LF auto"}{fromBlocks ? <span style={{ color: C.focus }}> · 96B</span> : null}</div>
             </div>
           );
         })}
@@ -1278,16 +1380,20 @@ function DemandEditor({ demand, setDemand, demandMU, setDemandMU, moNames, month
   );
 }
 
-function MarketEditor({ mkt, setMkt, moNames, months }) {
+function MarketEditor({ mkt, setMkt, moNames, months, uploaded96 }) {
   const up = (key, i, v) => { const m = { ...mkt }; if (Array.isArray(m[key])) { m[key] = [...m[key]]; m[key][i] = v; } else { m[key] = v; } setMkt(m); };
   const rows = [
-    { key: "damMCP", label: "DAM MCP ₹/kWh", color: C.dam },
-    { key: "gdamMCP", label: "GDAM MCP ₹/kWh", color: C.gdam },
+    { key: "damMCP", label: "DAM MCP ₹/kWh", color: C.dam, blk: "dam" },
+    { key: "gdamMCP", label: "GDAM MCP ₹/kWh", color: C.gdam, blk: "gdam" },
     { key: "bilatRate", label: "Bilateral ₹/kWh", color: C.bilat },
     { key: "bankRate", label: "Banking ₹/kWh", color: C.bank },
   ];
+  const hasRtmBlocks = !!(uploaded96 && uploaded96.rtm && Object.keys(uploaded96.rtm).length > 0);
   return (
     <div>
+      <div style={{ ...mono, fontSize: 10, color: C.t3, marginBottom: 6 }}>
+        Dispatch prices DAM/RTM/GDAM come from the loaded 96-block data — the MCP rows below are their monthly averages (read-only, <span style={{ color: C.focus }}>96B</span>) and act as fallback only for months without block data. Bilateral & Banking are genuinely monthly.
+      </div>
       <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr>
@@ -1297,12 +1403,17 @@ function MarketEditor({ mkt, setMkt, moNames, months }) {
           <tbody>
             {rows.map((r, ri) => (
               <tr key={r.key} style={{ background: ri % 2 === 0 ? C.elev : C.elev + "99" }}>
-                <td style={{ ...ui, fontSize: 11, padding: "4px 8px", borderBottom: `1px solid ${C.brd}15`, color: r.color, fontWeight: 500, position: "sticky", left: 0, background: ri % 2 === 0 ? C.elev : C.overlay, zIndex: 1 }}>{r.label}</td>
-                {moNames.map((_, i) => (
-                  <td key={i} style={{ padding: "3px 6px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
-                    <EditCell value={mkt[r.key][months[i].cal]} onChange={v => up(r.key, months[i].cal, v)} type="number" min={0} width={45} />
-                  </td>
-                ))}
+                <td style={{ ...ui, fontSize: 11, padding: "4px 8px", borderBottom: `1px solid ${C.brd}15`, color: r.color, fontWeight: 500, position: "sticky", left: 0, background: ri % 2 === 0 ? C.elev : C.overlay, zIndex: 1 }}>
+                  {r.label}{r.blk && uploaded96 && uploaded96[r.blk] && Object.keys(uploaded96[r.blk]).length > 0 ? <span style={{ ...mono, fontSize: 8, color: C.focus, marginLeft: 4 }}>96B AVG</span> : null}
+                </td>
+                {moNames.map((_, i) => {
+                  const fromBlocks = !!(r.blk && uploaded96 && uploaded96[r.blk] && uploaded96[r.blk][months[i].cal]);
+                  return (
+                    <td key={i} style={{ padding: "3px 6px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
+                      <EditCell value={mkt[r.key][months[i].cal]} onChange={v => up(r.key, months[i].cal, v)} type="number" min={0} width={45} disabled={fromBlocks} />
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
@@ -1319,12 +1430,15 @@ function MarketEditor({ mkt, setMkt, moNames, months }) {
           { key: "recSolarPrice", label: "REC Solar ₹/kWh", min: 0 },
           { key: "recNonSolarPrice", label: "REC Non-Sol ₹/kWh", min: 0 },
           { key: "carbonPrice", label: "Carbon ₹/tCO2", min: 0 },
-        ].map(p => (
-          <div key={p.key} style={{ background: C.elev, border: `1px solid ${C.brd}`, borderRadius: 5, padding: "6px 10px", minWidth: 110 }}>
-            <div style={{ ...ui, fontSize: 10, color: C.t2, textTransform: "uppercase", marginBottom: 4 }}>{p.label}</div>
-            <EditCell value={mkt[p.key] || 0} onChange={v => up(p.key, null, v)} type="number" min={p.min} max={p.max} width={55} />
-          </div>
-        ))}
+        ].map(p => {
+          const rtmOff = p.key === "rtmPrem" && hasRtmBlocks;
+          return (
+            <div key={p.key} style={{ background: C.elev, border: `1px solid ${C.brd}`, borderRadius: 5, padding: "6px 10px", minWidth: 110, opacity: rtmOff ? 0.5 : 1 }} title={rtmOff ? "Unused — RTM block prices are loaded" : undefined}>
+              <div style={{ ...ui, fontSize: 10, color: C.t2, textTransform: "uppercase", marginBottom: 4 }}>{p.label}{rtmOff ? " (96B)" : ""}</div>
+              <EditCell value={mkt[p.key] || 0} onChange={v => up(p.key, null, v)} type="number" min={p.min} max={p.max} width={55} disabled={rtmOff} />
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1334,10 +1448,12 @@ function MarketEditor({ mkt, setMkt, moNames, months }) {
 //  DATA UPLOADER — CSV template download + file upload
 // ══════════════════════════════════════════════════════════════
 const UPLOAD_SHEETS = [
-  { key: "demand", sheet: "Demand_MW", unit: "MW", color: C.warn, divisor: 1 },
-  { key: "dam", sheet: "DAM_Price_Rs_MWh", unit: "Rs/MWh→kWh", color: C.dam, divisor: 1000 },
-  { key: "rtm", sheet: "RTM_Price_Rs_MWh", unit: "Rs/MWh→kWh", color: C.neg, divisor: 1000 },
-  { key: "gdam", sheet: "GDAM_Price_Rs_MWh", unit: "Rs/MWh→kWh", color: C.gdam, divisor: 1000 },
+  { key: "demand", sheet: "Demand_Base_MW", alt: "Demand_MW", unit: "MW", color: C.warn, divisor: 1, chip: "Demand Base" },
+  { key: "demandHigh", sheet: "Demand_High_MW", unit: "MW", color: C.neg, divisor: 1, chip: "Demand High" },
+  { key: "demandLow", sheet: "Demand_Low_MW", unit: "MW", color: C.pos, divisor: 1, chip: "Demand Low" },
+  { key: "dam", sheet: "DAM_Price_Rs_MWh", unit: "Rs/MWh→kWh", color: C.dam, divisor: 1000, chip: "DAM" },
+  { key: "rtm", sheet: "RTM_Price_Rs_MWh", unit: "Rs/MWh→kWh", color: C.neg, divisor: 1000, chip: "RTM" },
+  { key: "gdam", sheet: "GDAM_Price_Rs_MWh", unit: "Rs/MWh→kWh", color: C.gdam, divisor: 1000, chip: "GDAM" },
 ];
 const TIME_LABELS = Array.from({ length: 96 }, (_, i) => {
   const h = Math.floor(i / 4), m = (i % 4) * 15;
@@ -1347,7 +1463,7 @@ const TIME_LABELS = Array.from({ length: 96 }, (_, i) => {
 const FY_MO = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun"];
 const FY_CAL = [6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5]; // FY index → calendar month
 
-function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploaded96, setUploaded96 }) {
+function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploaded96, setUploaded96, demandMU, setDemandMU }) {
   const [status, setStatus] = useState(null);
   const fileRef = useRef(null);
 
@@ -1367,7 +1483,7 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
       ws["!cols"] = [{ wch: 12 }, ...FY_MO.map(() => ({ wch: 10 }))];
       XLSX.utils.book_append_sheet(wb, ws, spec.sheet);
     });
-    XLSX.writeFile(wb, "UCED_96block_template.xlsx");
+    XLSX.writeFile(wb, "POPT_Outlook_96block_template.xlsx");
   };
 
   // Parse uploaded XLSX
@@ -1383,7 +1499,7 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
         let sheetsFound = 0;
 
         UPLOAD_SHEETS.forEach(spec => {
-          const ws = wb.Sheets[spec.sheet];
+          const ws = wb.Sheets[spec.sheet] || (spec.alt ? wb.Sheets[spec.alt] : null);
           if (!ws) return;
           sheetsFound++;
           const aoa = XLSX.utils.sheet_to_json(ws, { header: 1 });
@@ -1429,11 +1545,17 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
         // Also update monthly demand (peak from uploaded blocks) and market prices (averages)
         if (result.demand) {
           const newDemand = [...demand];
+          const newMU = [...(demandMU || Array(12).fill(0))];
           Object.entries(result.demand).forEach(([ci, arr]) => {
             const mx = Math.max(...arr);
-            if (mx > 0) newDemand[parseInt(ci)] = Math.round(mx);
+            const cal = parseInt(ci);
+            if (mx > 0) {
+              newDemand[cal] = Math.round(mx);
+              newMU[cal] = +(arr.reduce((s, v) => s + v, 0) / 96 * 24 * CAL_DAYS[cal] / 1000).toFixed(1);
+            }
           });
           setDemand(newDemand);
+          setDemandMU(newMU);
         }
         if (result.dam) {
           const newMkt = { ...mkt, damMCP: [...(mkt.damMCP || Array(12).fill(3.5))] };
@@ -1464,6 +1586,7 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
   const clearUploaded = () => {
     setUploaded96(REF96); // restore the built-in reference dataset
     setDemand(DEF_DEMAND);
+    setDemandMU(DEF_DEMAND_MU);
     setMkt(DEF_MKT);
     setStatus({ type: "ok", msg: "Restored built-in reference dataset (FY Jul–Jun)" });
   };
@@ -1494,7 +1617,7 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
         </div>
       )}
       <div style={{ ...ui, fontSize: 10, color: C.t3, lineHeight: 1.6 }}>
-        <strong style={{ color: C.t2 }}>Template format:</strong> 4 sheets — Demand_MW, DAM_Price_Rs_MWh, RTM_Price_Rs_MWh, GDAM_Price_Rs_MWh. Each sheet: 96 rows (00:00–23:45) × 12 month columns (Jul–Jun fiscal year). Prices in Rs/MWh (auto-converted to Rs/kWh). Partial uploads accepted — only matched sheets are imported.
+        <strong style={{ color: C.t2 }}>Template format:</strong> 6 sheets — Demand_Base_MW, Demand_High_MW, Demand_Low_MW (three demand forecast scenarios), DAM/RTM/GDAM_Price_Rs_MWh. Each sheet: 96 rows (00:00–23:45) × 12 month columns (Jul–Jun fiscal year). Prices in Rs/MWh (auto-converted to Rs/kWh). Partial uploads accepted — only matched sheets are imported (legacy Demand_MW is read as Base). High/Low forecasts drive the matching scenarios in Scenario Analysis.
       </div>
       {/* Upload status summary */}
       {hasData && (
@@ -1504,7 +1627,7 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
             const moCount = has ? Object.keys(uploaded96[spec.key]).length : 0;
             return (
               <div key={spec.key} style={{ ...mono, fontSize: 10, padding: "3px 10px", borderRadius: 3, background: has ? spec.color + "18" : C.elev, color: has ? spec.color : C.t3, border: `1px solid ${has ? spec.color + "44" : C.brd}` }}>
-                {spec.sheet.split("_")[0]}: {has ? `${moCount} mo` : "—"}
+                {spec.chip || spec.sheet.split("_")[0]}: {has ? `${moCount} mo` : "—"}
               </div>
             );
           })}
@@ -1525,14 +1648,14 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
                 return (
                   <tr key={spec.key} style={{ background: ri % 2 === 0 ? C.elev : C.elev + "99" }}>
                     <td style={{ ...ui, fontSize: 10, padding: "3px 6px", borderBottom: `1px solid ${C.brd}15`, color: spec.color, fontWeight: 500, position: "sticky", left: 0, background: ri % 2 === 0 ? C.elev : C.overlay, zIndex: 1 }}>
-                      {spec.key === "demand" ? "Peak MW" : `Avg ${spec.sheet.split("_")[0]} (Rs/kWh)`}
+                      {spec.key.startsWith("demand") ? `Peak MW (${spec.key === "demand" ? "Base" : spec.key === "demandHigh" ? "High" : "Low"})` : `Avg ${spec.chip} (Rs/kWh)`}
                     </td>
                     {moNames.map((_, i) => {
                       const ci = months[i].cal;
                       const arr = d[ci];
                       let v = "—";
                       if (arr) {
-                        if (spec.key === "demand") v = Math.round(Math.max(...arr));
+                        if (spec.key.startsWith("demand")) v = Math.round(Math.max(...arr));
                         else v = (arr.reduce((s, x) => s + x, 0) / 96).toFixed(2);
                       }
                       return <td key={i} style={{ ...mono, fontSize: 10, padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right", color: C.t1 }}>{v}</td>;
@@ -1551,30 +1674,55 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
 // ══════════════════════════════════════════════════════════════
 //  SCENARIO EDITOR
 // ══════════════════════════════════════════════════════════════
-function ScenarioEditor({ scenarios, setScenarios }) {
+function ScenarioEditor({ scenarios, setScenarios, uploaded96 }) {
   const update = (id, key, val) => setScenarios(prev => prev.map(s => s.id === id ? { ...s, [key]: val } : s));
+  const sheetLoaded = (set) => {
+    if (set === "high") return !!(uploaded96 && uploaded96.demandHigh && Object.keys(uploaded96.demandHigh).length > 0);
+    if (set === "low") return !!(uploaded96 && uploaded96.demandLow && Object.keys(uploaded96.demandLow).length > 0);
+    return !!(uploaded96 && uploaded96.demand && Object.keys(uploaded96.demand).length > 0);
+  };
   return (
     <div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 8 }}>
-        {scenarios.map(s => (
-          <div key={s.id} style={{ background: C.elev, border: `1px solid ${s.active ? s.color : C.brd}`, borderRadius: 6, padding: 12, borderLeft: `4px solid ${s.color}`, opacity: s.active ? 1 : 0.65 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
-              <input type="checkbox" checked={s.active} onChange={e => update(s.id, "active", e.target.checked)} style={{ cursor: "pointer" }} />
-              <span style={{ ...ui, fontSize: 12, fontWeight: 600, color: s.color }}>{s.name}</span>
-            </div>
-            {[
-              { key: "demMult", label: "Demand x" },
-              { key: "reMult", label: "RE Gen x" },
-              { key: "priceMult", label: "Price x" },
-              { key: "fuelMult", label: "Fuel Cost x" },
-            ].map(f => (
-              <div key={f.key} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-                <span style={{ ...ui, fontSize: 10, color: C.t2 }}>{f.label}</span>
-                <EditCell value={s[f.key]} onChange={v => update(s.id, f.key, v)} type="number" min={0.1} max={3.0} width={45} />
+      <div style={{ ...mono, fontSize: 10, color: C.t3, marginBottom: 6 }}>
+        Each scenario runs on a demand forecast (Base / High / Low — upload via the 96-block template). If the selected sheet isn't loaded, the scenario falls back to Base; multipliers apply on top of the chosen forecast.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 8 }}>
+        {scenarios.map(s => {
+          const set = s.demandSet || "base";
+          const loaded = sheetLoaded(set);
+          return (
+            <div key={s.id} style={{ background: C.elev, border: `1px solid ${s.active ? s.color : C.brd}`, borderRadius: 6, padding: 12, borderLeft: `4px solid ${s.color}`, opacity: s.active ? 1 : 0.65 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                <input type="checkbox" checked={s.active} onChange={e => update(s.id, "active", e.target.checked)} style={{ cursor: "pointer" }} />
+                <span style={{ ...ui, fontSize: 12, fontWeight: 600, color: s.color }}>{s.name}</span>
               </div>
-            ))}
-          </div>
-        ))}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <span style={{ ...ui, fontSize: 10, color: C.t2 }}>Demand Forecast</span>
+                <select value={set} onChange={e => update(s.id, "demandSet", e.target.value)} style={{ ...ui, fontSize: 10, background: C.overlay, color: set === "high" ? C.neg : set === "low" ? C.pos : C.t1, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 3px", cursor: "pointer" }}>
+                  <option value="base">Base</option>
+                  <option value="high">High</option>
+                  <option value="low">Low</option>
+                </select>
+              </div>
+              {set !== "base" && (
+                <div style={{ ...mono, fontSize: 9, color: loaded ? C.pos : C.warn, marginBottom: 6 }}>
+                  {loaded ? `✓ ${set.toUpperCase()} sheet loaded` : `${set.toUpperCase()} sheet not loaded → uses Base × mult`}
+                </div>
+              )}
+              {[
+                { key: "demMult", label: "Demand x" },
+                { key: "reMult", label: "RE Gen x" },
+                { key: "priceMult", label: "Price x" },
+                { key: "fuelMult", label: "Fuel Cost x" },
+              ].map(f => (
+                <div key={f.key} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <span style={{ ...ui, fontSize: 10, color: C.t2 }}>{f.label}</span>
+                  <EditCell value={s[f.key]} onChange={v => update(s.id, f.key, v)} type="number" min={0.1} max={3.0} width={45} />
+                </div>
+              ))}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1740,6 +1888,7 @@ function StackChart({ data, plants, res }) {
       if (b.src) Object.values(b.src).forEach(s => { if (s.mw > 0) byType[s.tp] = (byType[s.tp] || 0) + s.mw; });
       SEG_ORDER.forEach(seg => {
         let val = 0;
+        if (seg === "Charging") return; // handled below (negative)
         if (seg === "FDRE") val = b.fdreMW || 0;
         else if (seg === "STOA") val = b.stoaBuy || 0;
         else if (seg === "DAM") val = b.mktDAM || 0;
@@ -1748,6 +1897,8 @@ function StackChart({ data, plants, res }) {
         else val = byType[seg] || 0;
         if (val > 0) { row[seg] = Math.round(val); segSet.add(seg); }
       });
+      // Storage charging = load, drawn as negative bars so the dispatch view balances visually
+      if ((b.chg || 0) > 0) { row.Charging = -Math.round(b.chg); segSet.add("Charging"); }
       return row;
     });
     return { cd: rows, segs: SEG_ORDER.filter(s => segSet.has(s)) };
@@ -1755,12 +1906,13 @@ function StackChart({ data, plants, res }) {
   return (
     <div>
       <ResponsiveContainer width="100%" height={300}>
-        <ComposedChart data={cd} margin={{ top: 10, right: 10, bottom: 5, left: 10 }}>
+        <ComposedChart data={cd} margin={{ top: 10, right: 10, bottom: 5, left: 10 }} stackOffset="sign">
           <CartesianGrid stroke={C.brd + "66"} strokeDasharray="3 3" />
           <XAxis dataKey="lbl" tick={{ fill: C.t2, fontSize: 10 }} interval={res === "15min" ? 7 : 2} />
           <YAxis tick={{ fill: C.t2, fontSize: 10 }} label={{ value: "MW", angle: -90, position: "insideLeft", fill: C.t2, fontSize: 11 }} />
-          <Tooltip contentStyle={ttStyle} />
+          <Tooltip contentStyle={ttStyle} formatter={(v, name) => name === "Charging" ? [`${Math.abs(v)} MW (storage charging)`, name] : [v, name]} />
           <Legend wrapperStyle={{ fontSize: 10 }} iconType="square" />
+          <ReferenceLine y={0} stroke={C.t3} strokeWidth={1} />
           {segs.map(seg => <Bar key={seg} dataKey={seg} stackId="s" fill={SEG_CLR[seg] || C.t3} fillOpacity={0.9} />)}
           <Line type="monotone" dataKey="Demand" stroke={C.demandLine} strokeWidth={2.5} dot={false} name="Demand" />
         </ComposedChart>
@@ -1991,7 +2143,7 @@ function PriceChart({ data, res }) {
 
 function SoCChart({ data, plants, res }) {
   const storages = plants.filter(p => p.type === "BESS" || p.type === "PSP");
-  if (!storages.length) return null;
+  // NOTE: hooks must run before any early return (audit P2-8 fix — hook-count crash on first/last storage asset)
   const cd = useMemo(() => {
     if (!data || !data.length) return [];
     const src = res === "15min" ? data : aggHourly(data);
@@ -2001,6 +2153,7 @@ function SoCChart({ data, plants, res }) {
       return row;
     });
   }, [data, storages, res]);
+  if (!storages.length) return null;
   return (
     <div>
       <ResponsiveContainer width="100%" height={180}>
@@ -2048,8 +2201,8 @@ function SurplusDeficitChart({ data, res }) {
         </ComposedChart>
       </ResponsiveContainer>
       <div style={{ display: "flex", gap: 16, justifyContent: "center", marginTop: 4 }}>
-        <span style={{ ...mono, fontSize: 10, color: C.pos }}>▲ Surplus: sell/curtail</span>
-        <span style={{ ...mono, fontSize: 10, color: C.neg }}>▼ Deficit: buy from market</span>
+        <span style={{ ...mono, fontSize: 10, color: C.pos }}>▲ Surplus sold to market (curtailed excess shown in CURTAIL row/chart)</span>
+        <span style={{ ...mono, fontSize: 10, color: C.neg }}>▼ Deficit: market-covered + unserved</span>
       </div>
     </div>
   );
@@ -2060,8 +2213,7 @@ function SurplusDeficitChart({ data, res }) {
 // ══════════════════════════════════════════════════════════════
 function StorageCyclesChart({ data, plants, res }) {
   const storages = plants.filter(p => p.type === "BESS" || p.type === "PSP" || (p.type === "Hydro" && p.pondage === "with"));
-  if (!storages.length) return <div style={{ ...ui, fontSize: 11, color: C.t3, padding: 10 }}>No storage assets configured</div>;
-
+  // NOTE: hooks must run before any early return (audit P2-8 fix)
   const cd = useMemo(() => {
     if (!data || !data.length) return [];
     const src = res === "15min" ? data : aggHourly(data);
@@ -2102,6 +2254,8 @@ function StorageCyclesChart({ data, plants, res }) {
     });
     return stats;
   }, [data, storages]);
+
+  if (!storages.length) return <div style={{ ...ui, fontSize: 11, color: C.t3, padding: 10 }}>No storage assets configured</div>;
 
   const storColors = { BESS: SEG_CLR.BESS, PSP: SEG_CLR.PSP, Hydro: SEG_CLR.Hydro };
 
@@ -2239,18 +2393,25 @@ function ScenarioCompare({ scenarioResults }) {
     avgCost: s.avgCost,
     curtail: s.curtailMU,
     market: s.mktMU,
+    surplus: s.surMU || 0,
+    unserved: s.unsMU || 0,
   }));
   return (
     <div>
       <div style={{ display: "grid", gridTemplateColumns: `repeat(${scenarioResults.length}, 1fr)`, gap: 8, marginBottom: 12 }}>
         {scenarioResults.map(s => (
           <div key={s.id} style={{ background: C.overlay, borderRadius: 2, padding: 10, borderLeft: `3px solid ${s.color}` }}>
-            <div style={{ ...ui, fontSize: 11, fontWeight: 600, color: s.color, marginBottom: 6 }}>{s.name}</div>
+            <div style={{ ...ui, fontSize: 11, fontWeight: 600, color: s.color, marginBottom: 6 }}>
+              {s.name}
+              {s.demandSet && s.demandSet !== "base" && <span style={{ ...mono, fontSize: 8, marginLeft: 5, color: s.demandSet === "high" ? C.neg : C.pos }}>[{s.demandSet.toUpperCase()} FCST]</span>}
+            </div>
             <div style={{ ...mono, fontSize: 10, color: C.t2, lineHeight: 1.8 }}>
-              <div>Demand: <span style={{ color: C.val }}>{s.demMU}</span> MU</div>
+              <div>Demand: <span style={{ color: C.val }}>{s.demMU}</span> MU | Pk <span style={{ color: C.warn }}>{s.pkMax}</span> MW</div>
               <div>Cost: <span style={{ color: C.neg }}>{s.costCr}</span> Cr</div>
               <div>Avg: <span style={{ color: C.warn }}>{s.avgCost}</span> Rs/kWh</div>
               <div>Market: <span style={{ color: C.dam }}>{s.mktMU}</span> MU</div>
+              <div>Surplus: <span style={{ color: C.pos }}>{s.surMU}</span> MU</div>
+              <div>Unserved: <span style={{ color: s.unsMU > 0 ? C.neg : C.pos }}>{s.unsMU}</span> MU</div>
               <div>Curtail: <span style={{ color: s.curtailMU > 0 ? C.curtail : C.pos }}>{s.curtailMU}</span> MU</div>
             </div>
           </div>
@@ -2264,7 +2425,8 @@ function ScenarioCompare({ scenarioResults }) {
           <Tooltip contentStyle={ttStyle} /><Legend wrapperStyle={{ fontSize: 10 }} />
           <Bar dataKey="cost" fill={C.neg + "aa"} name="Cost (Cr)" radius={[2,2,0,0]} />
           <Bar dataKey="market" fill={C.dam + "88"} name="Market (MU)" radius={[2,2,0,0]} />
-          <Bar dataKey="curtail" fill={C.curtail + "88"} name="Curtail (MU)" radius={[2,2,0,0]} />
+          <Bar dataKey="surplus" fill={C.pos + "88"} name="Surplus (MU)" radius={[2,2,0,0]} />
+          <Bar dataKey="unserved" fill={C.curtail + "cc"} name="Unserved (MU)" radius={[2,2,0,0]} />
         </BarChart>
       </ResponsiveContainer>
     </div>
@@ -2316,7 +2478,8 @@ function BalanceHeatmap({ all }) {
   const { grid, maxAbs } = useMemo(() => {
     const g = all.map(r => ({
       mo: r.mo,
-      hours: Array.from({ length: 24 }, (_, h) => Math.round(safeMean(r.b96.slice(h * 4, h * 4 + 4), b => (b.sur || 0) - (b.def || 0)))),
+      // physical surplus = sold + curtailed (sur reports sold surplus only)
+      hours: Array.from({ length: 24 }, (_, h) => Math.round(safeMean(r.b96.slice(h * 4, h * 4 + 4), b => (b.sur || 0) + (b.curtailment || 0) - (b.def || 0)))),
     }));
     return { grid: g, maxAbs: Math.max(1, ...g.flatMap(m => m.hours.map(Math.abs))) };
   }, [all]);
@@ -2360,7 +2523,7 @@ function CapacityAdequacyChart({ all, plants }) {
       let tot = 0;
       plants.forEach(p => {
         if (p.commissionMonth != null && mi < p.commissionMonth) return;
-        const av = Math.round(p.pMax * effAvail(p, mi) / 100);
+        const av = Math.floor(p.pMax * effAvail(p, mi) / 100);
         if (av > 0) { row[p.type] = (row[p.type] || 0) + av; tot += av; segSet.add(p.type); }
       });
       row._total = tot;
@@ -2407,7 +2570,7 @@ function CostBalanceChart({ all }) {
       dam += (b.mktDAM || 0) * (b.damRate || 0);
       gdam += (b.mktGDAM || 0) * (b.gdamRate || 0);
       rtm += (b.mktRTM || 0) * (b.rtmRate || 0);
-      revL += (b.surRevenue || 0);
+      revL += (b.surRevenue || 0) + (b.stoaSellRev || 0);
     });
     const k = 0.25 * 10 / 1000 * r.days / 100; // Σ(MW × ₹/kWh) over blocks → ₹Cr/month
     return {
@@ -2416,11 +2579,11 @@ function CostBalanceChart({ all }) {
       "Own Var": +(own * k).toFixed(1),
       STOA: +(stoa * k).toFixed(1), FDRE: +(fdre * k).toFixed(1),
       DAM: +(dam * k).toFixed(1), GDAM: +(gdam * k).toFixed(1), RTM: +(rtm * k).toFixed(1),
-      "Surplus Rev": -+(revL * r.days / 100).toFixed(1),
+      "Sales Rev": -+(revL * r.days / 100).toFixed(1),
       avg: +(r.agg.avgCost || 0),
     };
   }), [all]);
-  const segs = [["Fixed", C.warn], ["Own Var", C.thermal], ["STOA", SEG_CLR.STOA], ["FDRE", SEG_CLR.FDRE], ["DAM", SEG_CLR.DAM], ["GDAM", SEG_CLR.GDAM], ["RTM", SEG_CLR.RTM], ["Surplus Rev", C.pos]];
+  const segs = [["Fixed", C.warn], ["Own Var", C.thermal], ["STOA", SEG_CLR.STOA], ["FDRE", SEG_CLR.FDRE], ["DAM", SEG_CLR.DAM], ["GDAM", SEG_CLR.GDAM], ["RTM", SEG_CLR.RTM], ["Sales Rev", C.pos]];
   return (
     <div>
       <ResponsiveContainer width="100%" height={260}>
@@ -2436,6 +2599,494 @@ function CostBalanceChart({ all }) {
           <Line yAxisId="avg" type="monotone" dataKey="avg" stroke={C.gas} strokeWidth={2} dot={{ r: 3, fill: C.gas }} name="Avg ₹/kWh" />
         </ComposedChart>
       </ResponsiveContainer>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  BANKING — DISCOM-to-DISCOM banking proposal evaluation
+//  Modelled on trader banking offers (draw windows vs return obligation at a
+//  return %, with trading margin + ISTS/T-GNA + fixed charges) evaluated
+//  against the portfolio's own hourly surplus/deficit position.
+// ══════════════════════════════════════════════════════════════
+// Schedule-row model (mirrors real banking calculation sheets): each row is a
+// month-range × hour-window × quantum. Multiple rows per month are allowed —
+// hours/quantum can differ month to month AND within a month (overlaps add up).
+// Month ranges may wrap the year (e.g. Nov→Mar). Hours accept halves (7.5 = 07:30).
+const DEF_BANK_PROP = {
+  name: "New Banking Proposal", cpty: "Counterparty DISCOM",
+  drawRows: [
+    { moFrom: 4, moTo: 8, fromHr: 19, toHr: 24, mw: 1000 }, // May–Sep evenings
+    { moFrom: 4, moTo: 8, fromHr: 0, toHr: 5, mw: 1000 },   // May–Sep nights
+  ],
+  retRows: [
+    { moFrom: 10, moTo: 2, fromHr: 0, toHr: 24, mw: 485 },  // Nov–Mar RTC
+  ],
+  returnPct: 115,          // contractual return ratio — settlement check vs scheduled return
+  tradingMargin: 0.05,     // ₹/kWh, on draw leg only
+  istsDraw: 0.47, istsRet: 0.59, // ₹/kWh transmission (T-GNA/ISTS+SLDC) per leg
+  fixedFeesL: 2.5,         // ₹ lakh lump (NLDC applications, misc)
+};
+const moInRange = (row, cal) => row.moFrom <= row.moTo ? (cal >= row.moFrom && cal <= row.moTo) : (cal >= row.moFrom || cal <= row.moTo);
+// Hourly MW profile for one calendar month from a set of schedule rows (null if none active)
+const bankProfile = (rows, cal) => {
+  const prof = Array(96).fill(0);
+  let any = false;
+  (rows || []).forEach(row => {
+    if (!moInRange(row, cal)) return;
+    const b0 = Math.max(0, Math.round((row.fromHr || 0) * 4)), b1 = Math.min(96, Math.round((row.toHr || 0) * 4));
+    for (let t = b0; t < b1; t++) { prof[t] += row.mw || 0; any = true; }
+  });
+  return any ? prof : null;
+};
+// Pure evaluation — testable. `all` = 12-month dispatch results (scenario-filtered).
+function evalBankingProposal(all, prop) {
+  let drawMWh = 0, usefulMWh = 0, drawValRs = 0;
+  let retMWh = 0, servable = 0, retValRs = 0;
+  const monthly = [];
+  all.forEach(r => {
+    const dp = bankProfile(prop.drawRows, r.cal);
+    if (dp) {
+      let mDraw = 0, mUseful = 0;
+      for (let t = 0; t < 96; t++) {
+        if (dp[t] <= 0) continue;
+        const b = r.b96[t]; if (!b) continue;
+        const e = dp[t] * 0.25 * r.days; // MWh in this block across the month
+        mDraw += e;
+        mUseful += Math.min(dp[t], b.def) * 0.25 * r.days; // lands where we'd otherwise buy/shed
+        drawValRs += e * 1000 * b.damRate; // avoided purchase valued at block DAM
+      }
+      drawMWh += mDraw; usefulMWh += mUseful;
+      if (mDraw > 0) monthly.push({ mo: r.mo, type: "DRAW", mwh: mDraw, fit: mUseful / mDraw * 100 });
+    }
+    const rp = bankProfile(prop.retRows, r.cal);
+    if (rp) {
+      let mRet = 0, mServ = 0;
+      for (let t = 0; t < 96; t++) {
+        if (rp[t] <= 0) continue;
+        const b = r.b96[t]; if (!b) continue;
+        const e = rp[t] * 0.25 * r.days;
+        mRet += e;
+        mServ += Math.min(rp[t], (b.sur || 0) + (b.curtailment || 0)) * 0.25 * r.days; // servable from PHYSICAL surplus (sold + spilled)
+        retValRs += e * 1000 * b.damRate;                // return energy valued at block DAM
+      }
+      retMWh += mRet; servable += mServ;
+      if (mRet > 0) monthly.push({ mo: r.mo, type: "RETURN", mwh: mRet, fit: mServ / mRet * 100 });
+    }
+  });
+  const requiredRet = drawMWh * (prop.returnPct || 100) / 100; // contractual obligation
+  const tmRs = drawMWh * 1000 * (prop.tradingMargin || 0);
+  const istsDrawRs = drawMWh * 1000 * (prop.istsDraw || 0);
+  const istsRetRs = retMWh * 1000 * (prop.istsRet || 0);
+  const fixedRs = (prop.fixedFeesL || 0) * 1e5;
+  const costRs = retValRs + tmRs + istsDrawRs + istsRetRs + fixedRs;
+  // Energy-weighted DAM rates per leg (the opportunity-cost benchmarks)
+  const damDraw = drawMWh > 0 ? drawValRs / (drawMWh * 1000) : 0;   // ₹/kWh, draw profile @ block DAM
+  const damRet = retMWh > 0 ? retValRs / (retMWh * 1000) : 0;       // ₹/kWh, return profile @ block DAM
+  return {
+    drawMU: drawMWh / 1000, drawFit: drawMWh > 0 ? usefulMWh / drawMWh * 100 : 0,
+    retMU: retMWh / 1000, retFit: retMWh > 0 ? servable / retMWh * 100 : 0,
+    requiredRetMU: requiredRet / 1000, settleMU: (retMWh - requiredRet) / 1000, // + over-return / − leftover owed
+    drawValCr: drawValRs / 1e7, retCostCr: retValRs / 1e7, tmCr: tmRs / 1e7,
+    istsDrawCr: istsDrawRs / 1e7, istsRetCr: istsRetRs / 1e7, istsCr: (istsDrawRs + istsRetRs) / 1e7, fixedCr: fixedRs / 1e7,
+    // Leg-wise opportunity view vs DAM:
+    onwardSaveCr: (drawValRs - tmRs - istsDrawRs) / 1e7,            // DAM purchase avoided − cash cost of draw leg
+    returnBurdenCr: (retValRs + istsRetRs + fixedRs) / 1e7,         // opportunity + cash cost of return leg
+    netCr: (drawValRs - costRs) / 1e7,
+    netPerKwh: drawMWh > 0 ? (drawValRs - costRs) / (drawMWh * 1000) : 0, // ₹/kWh of drawn energy
+    effRate: drawMWh > 0 ? costRs / (drawMWh * 1000) : 0,           // all-in ₹/kWh of drawn energy
+    damDraw, damRet, monthly,
+  };
+}
+
+function BankingPage({ allEv, evScenario, scenarios, bankSc, setBankSc, bankProp, setBankProp, stoa, moNames, months, setTab }) {
+  const ev = useMemo(() => evalBankingProposal(allEv, bankProp), [allEv, bankProp]);
+  const up = (key, v) => setBankProp(prev => ({ ...prev, [key]: v }));
+  const upRow = (field, idx, key, v) => setBankProp(prev => ({ ...prev, [field]: prev[field].map((x, i) => i === idx ? { ...x, [key]: v } : x) }));
+  const addRow = (field, def) => setBankProp(prev => ({ ...prev, [field]: [...prev[field], def] }));
+  const delRow = (field, idx) => setBankProp(prev => ({ ...prev, [field]: prev[field].filter((_, i) => i !== idx) }));
+  const banking = stoa.filter(s => s.seg === "Banking");
+  const fitClr = f => f >= 70 ? C.pos : f >= 40 ? C.warn : C.neg;
+  const moSel = (val, onCh) => (
+    <select value={val} onChange={e => onCh(+e.target.value)} style={{ ...mono, fontSize: 10, background: C.overlay, color: C.t1, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "1px 2px", cursor: "pointer" }}>
+      {CAL_MO.map((m, i) => <option key={m} value={i}>{m}</option>)}
+    </select>
+  );
+  // Schedule-row table shared by both legs
+  const schedTable = (field, color, addDef) => (
+    <div>
+      <table style={{ borderCollapse: "collapse" }}>
+        <thead><tr>{["From Mo", "To Mo", "From Hr", "To Hr", "MW", ""].map((h, i) => (
+          <th key={i} style={{ ...lbl, fontSize: 9, fontWeight: 700, color: C.t3, padding: "2px 6px", textAlign: i > 1 ? "right" : "left" }}>{h}</th>
+        ))}</tr></thead>
+        <tbody>{bankProp[field].map((row, i) => (
+          <tr key={i}>
+            <td style={{ padding: "2px 6px" }}>{moSel(row.moFrom, v => upRow(field, i, "moFrom", v))}</td>
+            <td style={{ padding: "2px 6px" }}>{moSel(row.moTo, v => upRow(field, i, "moTo", v))}</td>
+            <td style={{ padding: "2px 6px", textAlign: "right" }}><EditCell value={row.fromHr} onChange={v => upRow(field, i, "fromHr", v)} type="number" min={0} max={24} width={32} /></td>
+            <td style={{ padding: "2px 6px", textAlign: "right" }}><EditCell value={row.toHr} onChange={v => upRow(field, i, "toHr", v)} type="number" min={0} max={24} width={32} /></td>
+            <td style={{ padding: "2px 6px", textAlign: "right" }}><EditCell value={row.mw} onChange={v => upRow(field, i, "mw", v)} type="number" min={0} width={45} /></td>
+            <td style={{ padding: "2px 4px" }}><button onClick={() => delRow(field, i)} style={{ background: "none", border: "none", color: C.neg, cursor: "pointer", fontSize: 11 }}>x</button></td>
+          </tr>
+        ))}</tbody>
+      </table>
+      <button onClick={() => addRow(field, addDef)} style={{ ...lbl, fontSize: 9, padding: "2px 8px", marginTop: 3, background: color + "15", color, border: `1px solid ${color}33`, borderRadius: 2, cursor: "pointer" }}>+ ROW</button>
+    </div>
+  );
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {/* Scenario selector — evaluation runs against the selected demand/price scenario */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", background: C.panel, border: `1px solid ${C.brd}`, borderRadius: 2, padding: "6px 10px" }}>
+        <span style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2 }}>EVALUATE AGAINST</span>
+        {scenarios.filter(s => s.active).map(s => (
+          <button key={s.id} onClick={() => setBankSc(s.id)} style={{
+            ...lbl, fontSize: 10, padding: "3px 10px", borderRadius: 2, cursor: "pointer",
+            border: bankSc === s.id ? `1px solid ${s.color}` : `1px solid ${C.brd}88`,
+            background: bankSc === s.id ? s.color + "22" : C.elev,
+            color: bankSc === s.id ? s.color : C.t1, fontWeight: bankSc === s.id ? 700 : 500,
+          }}>{s.name}</button>
+        ))}
+        {evScenario && evScenario.demandSet && evScenario.demandSet !== "base" && (
+          <span style={{ ...mono, fontSize: 9, color: evScenario.demandSet === "high" ? C.neg : C.pos }}>[{evScenario.demandSet.toUpperCase()} FORECAST]</span>
+        )}
+      </div>
+      {/* Verdict KPIs */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 6 }}>
+        <KPI label="Draw Energy" value={ev.drawMU.toFixed(0)} unit="MU" accent={C.bank} color={C.bank} />
+        <KPI label="Draw Deficit-Fit" value={ev.drawFit.toFixed(0)} unit="%" color={fitClr(ev.drawFit)} accent={fitClr(ev.drawFit)} sub="lands in deficit hours" />
+        <KPI label="Return Scheduled" value={ev.retMU.toFixed(0)} unit="MU" color={C.warn} accent={C.warn} sub={`required @${bankProp.returnPct}%: ${ev.requiredRetMU.toFixed(0)} MU`} />
+        <KPI label="Return Surplus-Fit" value={ev.retFit.toFixed(0)} unit="%" color={fitClr(ev.retFit)} accent={fitClr(ev.retFit)} sub="servable from surplus" />
+        <KPI label="Net Benefit" value={ev.netCr.toFixed(1)} unit="Cr" color={ev.netCr > 0 ? C.pos : C.neg} accent={ev.netCr > 0 ? C.pos : C.neg} sub="vs DAM alternative" />
+        <KPI label="Effective Rate" value={ev.effRate.toFixed(2)} unit="₹/kWh" color={ev.effRate < ev.damDraw ? C.pos : C.neg} accent={ev.effRate < ev.damDraw ? C.pos : C.neg} sub={`draw-window DAM ₹${ev.damDraw.toFixed(2)}`} />
+      </div>
+      <div style={{ ...mono, fontSize: 10, color: C.t3 }}>
+        Draw valued at block DAM (avoided purchase); return costed at block DAM (foregone surplus sale / procurement) + return premium + charges. Fit %s measured against the selected scenario's hourly surplus/deficit.
+      </div>
+
+      {/* Proposal editor */}
+      <Panel title="BANKING PROPOSAL UNDER EVALUATION" accent={C.bank}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {/* Identity row */}
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ ...lbl, fontSize: 10, color: C.t2 }}>PROPOSAL</span>
+            <EditCell value={bankProp.name} onChange={v => up("name", v)} type="text" width={180} />
+            <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: 8 }}>COUNTERPARTY</span>
+            <EditCell value={bankProp.cpty} onChange={v => up("cpty", v)} type="text" width={140} />
+          </div>
+          {/* Even 4-card grid */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))", gap: 10, alignItems: "stretch" }}>
+            <div style={{ background: C.elev, border: `1px solid ${C.brd}`, borderRadius: 4, padding: 10, borderTop: `2px solid ${C.bank}` }}>
+              <div style={{ ...lbl, fontSize: 10, color: C.bank, marginBottom: 6 }}>DRAW SCHEDULE (WE RECEIVE)</div>
+              {schedTable("drawRows", C.bank, { moFrom: 4, moTo: 8, fromHr: 0, toHr: 5, mw: 500 })}
+              <div style={{ ...mono, fontSize: 9, color: C.t3, marginTop: 6 }}>
+                Rows can repeat a month with different hours/MW — overlaps add up. Half-hours OK (7.5 = 07:30). Month ranges may wrap the year.
+              </div>
+            </div>
+            <div style={{ background: C.elev, border: `1px solid ${C.brd}`, borderRadius: 4, padding: 10, borderTop: `2px solid ${C.warn}` }}>
+              <div style={{ ...lbl, fontSize: 10, color: C.warn, marginBottom: 6 }}>RETURN SCHEDULE (WE SUPPLY)</div>
+              {schedTable("retRows", C.warn, { moFrom: 10, moTo: 2, fromHr: 0, toHr: 24, mw: 200 })}
+              <div style={{ display: "flex", gap: 4, alignItems: "center", marginTop: 8, ...mono, fontSize: 10, color: C.t2 }}>
+                Contractual return <EditCell value={bankProp.returnPct} onChange={v => up("returnPct", v)} type="number" min={100} max={150} width={35} />%
+              </div>
+              <div style={{ ...mono, fontSize: 10, marginTop: 4, color: Math.abs(ev.settleMU) < ev.requiredRetMU * 0.02 ? C.pos : C.warn }}>
+                Settlement: {ev.retMU.toFixed(0)} vs {ev.requiredRetMU.toFixed(0)} MU required → {ev.settleMU >= 0 ? "+" : ""}{ev.settleMU.toFixed(0)} MU{ev.settleMU < 0 ? " (leftover owed)" : ev.settleMU > 0 ? " (over-return)" : ""}
+              </div>
+            </div>
+            <div style={{ background: C.elev, border: `1px solid ${C.brd}`, borderRadius: 4, padding: 10, borderTop: `2px solid ${C.t3}` }}>
+              <div style={{ ...lbl, fontSize: 10, color: C.t2, marginBottom: 6 }}>CHARGES</div>
+              <div style={{ ...mono, fontSize: 10, color: C.t2 }}>
+                {[
+                  ["Trading margin", "tradingMargin", "₹/kWh"],
+                  ["ISTS draw leg", "istsDraw", "₹/kWh"],
+                  ["ISTS return leg", "istsRet", "₹/kWh"],
+                  ["Fixed fees", "fixedFeesL", "₹ lakh"],
+                ].map(([label, key, unit]) => (
+                  <div key={key} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                    <span>{label}</span>
+                    <span><EditCell value={bankProp[key]} onChange={v => up(key, v)} type="number" min={0} width={42} /> <span style={{ color: C.t3, fontSize: 9 }}>{unit}</span></span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ background: C.elev, border: `1px solid ${C.brd}`, borderRadius: 4, padding: 10, borderTop: `2px solid ${ev.netCr > 0 ? C.pos : C.neg}` }}>
+              <div style={{ ...lbl, fontSize: 10, color: C.t2, marginBottom: 6 }}>ECONOMICS (₹ Cr)</div>
+              <div style={{ ...mono, fontSize: 10, color: C.t2 }}>
+                {[
+                  ["Draw value (avoided DAM)", `+${ev.drawValCr.toFixed(1)}`, C.pos],
+                  ["Return energy cost", `−${ev.retCostCr.toFixed(1)}`, C.neg],
+                  ["Trading margin", `−${ev.tmCr.toFixed(2)}`, C.neg],
+                  ["Transmission (both legs)", `−${ev.istsCr.toFixed(1)}`, C.neg],
+                  ["Fixed fees", `−${ev.fixedCr.toFixed(2)}`, C.neg],
+                ].map(([label, val, clr]) => (
+                  <div key={label} style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+                    <span>{label}</span><span style={{ color: clr }}>{val}</span>
+                  </div>
+                ))}
+                <div style={{ display: "flex", justifyContent: "space-between", borderTop: `1px solid ${C.brd}`, paddingTop: 5, fontWeight: 700 }}>
+                  <span>NET</span><span style={{ color: ev.netCr > 0 ? C.pos : C.neg }}>{ev.netCr > 0 ? "+" : ""}{ev.netCr.toFixed(1)}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Panel>
+
+      {/* Opportunity cost vs DAM — leg-wise, ₹ Cr and ₹/kWh */}
+      <Panel title="OPPORTUNITY COST ANALYSIS vs DAM" accent={C.dam}>
+        {(() => {
+          const row = (label, cr, rate, opts = {}) => (
+            <tr key={label} style={{ background: opts.hd ? C.overlay : "transparent" }}>
+              <td style={{ ...(opts.hd ? lbl : ui), fontSize: opts.hd ? 10 : 11, fontWeight: opts.hd ? 700 : 400, padding: "5px 10px", borderBottom: `1px solid ${C.brd}${opts.hd ? "" : "15"}`, color: opts.clr || (opts.hd ? C.t2 : C.t1) }}>{label}</td>
+              <td style={{ ...mono, fontSize: 11, padding: "5px 10px", borderBottom: `1px solid ${C.brd}${opts.hd ? "" : "15"}`, textAlign: "right", color: opts.crClr || C.t1, fontWeight: opts.hd ? 700 : 400 }}>{cr}</td>
+              <td style={{ ...mono, fontSize: 11, padding: "5px 10px", borderBottom: `1px solid ${C.brd}${opts.hd ? "" : "15"}`, textAlign: "right", color: opts.rtClr || C.t2, fontWeight: opts.hd ? 700 : 400 }}>{rate}</td>
+            </tr>
+          );
+          const onwardCashKwh = (bankProp.tradingMargin || 0) + (bankProp.istsDraw || 0);
+          const onwardSaveKwh = ev.damDraw - onwardCashKwh;
+          const retBurdenKwh = ev.retMU > 0 ? ev.returnBurdenCr * 1e7 / (ev.retMU * 1e6) : 0;
+          return (
+            <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead><tr>{["", "₹ Cr", "₹/kWh"].map((h, i) => (
+                  <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "6px 10px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 0 ? "right" : "left" }}>{h}</th>
+                ))}</tr></thead>
+                <tbody>
+                  {row(`ONWARD LEG — draw ${ev.drawMU.toFixed(0)} MU (per drawn kWh)`, "", "", { hd: true, clr: C.bank })}
+                  {row("DAM purchase alternative (draw profile @ block DAM)", ev.drawValCr.toFixed(1), ev.damDraw.toFixed(2), { crClr: C.pos })}
+                  {row("less: trading margin", "−" + ev.tmCr.toFixed(2), (bankProp.tradingMargin || 0).toFixed(2), { crClr: C.neg })}
+                  {row("less: ISTS/T-GNA draw leg", "−" + ev.istsDrawCr.toFixed(1), (bankProp.istsDraw || 0).toFixed(2), { crClr: C.neg })}
+                  {row("ONWARD ADVANTAGE vs DAM", (ev.onwardSaveCr >= 0 ? "+" : "") + ev.onwardSaveCr.toFixed(1), onwardSaveKwh.toFixed(2), { hd: true, crClr: ev.onwardSaveCr >= 0 ? C.pos : C.neg, rtClr: ev.onwardSaveCr >= 0 ? C.pos : C.neg })}
+                  {row(`RETURN LEG — supply ${ev.retMU.toFixed(0)} MU (per returned kWh)`, "", "", { hd: true, clr: C.warn })}
+                  {row("Return energy opportunity (return profile @ block DAM)", "−" + ev.retCostCr.toFixed(1), ev.damRet.toFixed(2), { crClr: C.neg })}
+                  {row("ISTS/T-GNA return leg", "−" + ev.istsRetCr.toFixed(1), (bankProp.istsRet || 0).toFixed(2), { crClr: C.neg })}
+                  {row("Fixed fees (SLDC/NLDC etc.)", "−" + ev.fixedCr.toFixed(2), "—", { crClr: C.neg })}
+                  {row("RETURN BURDEN", "−" + ev.returnBurdenCr.toFixed(1), retBurdenKwh.toFixed(2), { hd: true, crClr: C.neg, rtClr: C.neg })}
+                  {row("NET (per drawn kWh)", "", "", { hd: true, clr: C.t1 })}
+                  {row("NET BENEFIT vs DAM ALTERNATIVE", (ev.netCr >= 0 ? "+" : "") + ev.netCr.toFixed(1), (ev.netPerKwh >= 0 ? "+" : "") + ev.netPerKwh.toFixed(2), { hd: true, crClr: ev.netCr >= 0 ? C.pos : C.neg, rtClr: ev.netCr >= 0 ? C.pos : C.neg })}
+                  {row("All-in effective cost of banked power", "", `${ev.effRate.toFixed(2)} (${ev.damDraw > 0 ? Math.round(ev.effRate / ev.damDraw * 100) : 0}% of DAM)`, { rtClr: ev.effRate < ev.damDraw ? C.pos : C.neg })}
+                </tbody>
+              </table>
+            </div>
+          );
+        })()}
+        <div style={{ ...mono, fontSize: 9, color: C.t3, marginTop: 6 }}>
+          DAM benchmarks are energy-weighted block prices of each leg's own profile under the selected scenario. The asymmetry is the deal: draw priced at {ev.damDraw.toFixed(2)} ₹/kWh windows, returned at {ev.damRet.toFixed(2)} ₹/kWh windows{ev.damDraw > ev.damRet ? " — seasonal spread works in our favour" : " — spread works against us"}.
+        </div>
+      </Panel>
+
+      {/* Monthly compatibility */}
+      <Panel title="MONTHLY COMPATIBILITY vs OWN SUPPLY-DEMAND GAP" accent={C.info}>
+        <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr>{["Month", "Leg", "Energy MU", "Gap-Fit %", "Reading"].map((h, i) => (
+              <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "6px 8px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 1 ? "right" : "left" }}>{h}</th>
+            ))}</tr></thead>
+            <tbody>{ev.monthly.map((m, i) => (
+              <tr key={i} style={{ background: i % 2 === 0 ? C.elev : C.elev + "99" }}>
+                <td style={{ ...mono, fontSize: 11, padding: "4px 8px", borderBottom: `1px solid ${C.brd}15` }}>{m.mo}</td>
+                <td style={{ ...lbl, fontSize: 10, padding: "4px 8px", borderBottom: `1px solid ${C.brd}15`, color: m.type === "DRAW" ? C.bank : C.warn }}>{m.type}</td>
+                <td style={{ ...mono, fontSize: 11, padding: "4px 8px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>{(m.mwh / 1000).toFixed(1)}</td>
+                <td style={{ ...mono, fontSize: 11, padding: "4px 8px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right", color: fitClr(m.fit), fontWeight: 700 }}>{m.fit.toFixed(0)}%</td>
+                <td style={{ ...ui, fontSize: 10, padding: "4px 8px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right", color: C.t3 }}>
+                  {m.type === "DRAW"
+                    ? (m.fit >= 70 ? "fills real deficit" : m.fit >= 40 ? "partly displaces market" : "mostly adds surplus")
+                    : (m.fit >= 70 ? "served from surplus" : m.fit >= 40 ? "part-surplus, part-procured" : "needs new procurement")}
+                </td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </Panel>
+
+      {/* Active banking contracts (from Configure) */}
+      <Panel title="ACTIVE BANKING CONTRACTS (from Configure → STOA)" accent={C.bank}>
+        {banking.length === 0 ? (
+          <div style={{ ...ui, fontSize: 11, color: C.t3, padding: 10, textAlign: "center" }}>No banking contracts configured. <span style={{ color: C.focus, cursor: "pointer", textDecoration: "underline" }} onClick={() => setTab("config")}>Add in Configure → STOA Contracts → Banking</span>.</div>
+        ) : (
+          <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead><tr>{["Name", "Counterparty", "Dir", "MW", "Rate ₹/kWh", "Loss %", "Withdraw Months", "Inject Months", "Withdraw MU/yr", "Status"].map((h, i) => (
+                <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "6px 6px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 2 && i < 6 ? "right" : "left", whiteSpace: "nowrap" }}>{h}</th>
+              ))}</tr></thead>
+              <tbody>{banking.map((s, ri) => {
+                const moStr = (arr) => arr ? moNames.filter((_, i) => arr[months[i].cal]).join(" ") : "—";
+                const wdMU = (s.withdrawMo || []).reduce((sum, on, cal) => sum + (on ? s.mw * 24 * CAL_DAYS[cal] / 1000 : 0), 0) * (1 - (s.lossPct || 0) / 100);
+                return (
+                  <tr key={s.id} style={{ background: ri % 2 === 0 ? C.elev : C.elev + "99" }}>
+                    <td style={{ ...ui, fontSize: 11, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15` }}>{s.name}</td>
+                    <td style={{ ...ui, fontSize: 10, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15`, color: C.t2 }}>{s.cpty}</td>
+                    <td style={{ ...lbl, fontSize: 10, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15`, color: s.dir === "BUY" ? C.pos : C.neg }}>{s.dir}</td>
+                    <td style={{ ...mono, fontSize: 11, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>{s.mw}</td>
+                    <td style={{ ...mono, fontSize: 11, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>{s.rate}</td>
+                    <td style={{ ...mono, fontSize: 11, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>{s.lossPct || 0}</td>
+                    <td style={{ ...mono, fontSize: 10, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15`, color: C.pos }}>{moStr(s.withdrawMo)}</td>
+                    <td style={{ ...mono, fontSize: 10, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15`, color: C.warn }}>{moStr(s.injectMo)}</td>
+                    <td style={{ ...mono, fontSize: 11, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>{wdMU.toFixed(0)}</td>
+                    <td style={{ ...lbl, fontSize: 10, padding: "4px 6px", borderBottom: `1px solid ${C.brd}15`, color: s.status === "ACTIVE" ? C.pos : C.warn }}>{s.status}</td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ ...mono, fontSize: 9, color: C.t3, marginTop: 6 }}>
+          Contracted banking flows already enter the dispatch (withdraw = supply in withdraw months, inject = surplus absorption in inject months, loss-adjusted). The evaluator above is for NEW proposals — accept one by adding it as a Banking contract in Configure.
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  GAP ANALYSIS TABLES (month × hour matrices + band summaries)
+// ══════════════════════════════════════════════════════════════
+const hourlyMatrix = (all, fn) => all.map(r => ({ mo: r.mo, cal: r.cal, hours: Array.from({ length: 24 }, (_, h) => Math.round(safeMean(r.b96.slice(h * 4, h * 4 + 4), fn))) }));
+const GAP_BANDS = [["00:00-05:00", 0, 5], ["05:00-18:00", 5, 18], ["18:00-24:00", 18, 24]];
+const thT = { ...lbl, fontSize: 9, fontWeight: 700, color: C.t2, padding: "5px 6px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: "right", whiteSpace: "nowrap", position: "sticky", top: 0, zIndex: 1 };
+const tdT = { ...mono, fontSize: 10, padding: "2px 6px", borderBottom: `1px solid ${C.brd}10`, textAlign: "right", whiteSpace: "nowrap" };
+const rowHd = (extra = {}) => ({ ...tdT, textAlign: "left", color: C.t2, position: "sticky", left: 0, background: C.panel, zIndex: 1, ...extra });
+
+// Hourly average demand, Excel-style heat scale, with band-max summary rows
+function HourlyDemandTable({ all }) {
+  const mtx = useMemo(() => hourlyMatrix(all, b => b.dem), [all]);
+  const vals = mtx.flatMap(m => m.hours);
+  const mn = Math.min(...vals), mx = Math.max(...vals), mid = (mn + mx) / 2;
+  const clr = v => v <= mid
+    ? `rgba(0,230,118,${(0.42 * (mid - v) / Math.max(1, mid - mn)).toFixed(2)})`
+    : `rgba(255,82,82,${(0.42 * (v - mid) / Math.max(1, mx - mid)).toFixed(2)})`;
+  return (
+    <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2, maxHeight: 480 }}>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead><tr>
+          <th style={{ ...thT, textAlign: "left", left: 0, zIndex: 2 }}>HOUR</th>
+          {mtx.map(m => <th key={m.mo} style={thT}>{m.mo}</th>)}
+        </tr></thead>
+        <tbody>
+          {Array.from({ length: 24 }, (_, h) => (
+            <tr key={h}>
+              <td style={rowHd()}>{`${String(h).padStart(2, "0")}:00-${String(h + 1).padStart(2, "0")}:00`}</td>
+              {mtx.map(m => <td key={m.mo} style={{ ...tdT, background: clr(m.hours[h]), color: C.t1 }}>{m.hours[h].toLocaleString("en-IN")}</td>)}
+            </tr>
+          ))}
+          {GAP_BANDS.map(([lb, h0, h1]) => (
+            <tr key={lb} style={{ background: C.overlay }}>
+              <td style={rowHd({ color: C.warn, fontWeight: 700, background: C.overlay })}>MAX {lb}</td>
+              {mtx.map(m => <td key={m.mo} style={{ ...tdT, color: C.warn, fontWeight: 700 }}>{Math.max(...m.hours.slice(h0, h1)).toLocaleString("en-IN")}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// Hourly supply-demand gap BEFORE market purchases (+surplus / −to-be-procured),
+// with band minima, market capability, maintenance MW, and monthly MU summary rows
+function HourlyGapTable({ all, plants, mkt }) {
+  const mtx = useMemo(() => hourlyMatrix(all, b => (b.sur || 0) + (b.curtailment || 0) - (b.def || 0)), [all]);
+  const maxAbs = Math.max(1, ...mtx.flatMap(m => m.hours.map(Math.abs)));
+  const clr = v => v === 0 ? "transparent" : v > 0
+    ? `rgba(0,230,118,${(0.08 + 0.38 * v / maxAbs).toFixed(2)})`
+    : `rgba(255,82,82,${(0.10 + 0.48 * -v / maxAbs).toFixed(2)})`;
+  const maint = all.map(r => Math.round(safeSum(plants, p => {
+    const base = p.avail ?? 100, eff = effAvail(p, r.cal);
+    return eff < base ? p.pMax * (base - eff) / 100 : 0;
+  })));
+  const mktCap = (mkt.damLim || 0) + (mkt.gdamLim || 0) + (mkt.rtmLim || 0);
+  const fmt = v => v.toLocaleString("en-IN");
+  const sumRows = [
+    { lbl: "MARKET CAPABILITY (MW)", vals: all.map(() => mktCap), c: C.dam },
+    { lbl: "MW ON PLANNED OUTAGE", vals: maint, c: C.neg },
+    { lbl: "SURPLUS / MONTH (MU)", vals: all.map(r => r.agg.surMU), c: C.pos },
+    { lbl: "MARKET PURCHASE (MU)", vals: all.map(r => +(((r.agg.mktDAM_MU || 0) + (r.agg.mktGDAM_MU || 0) + (r.agg.mktRTM_MU || 0)).toFixed(1))), c: C.dam },
+    { lbl: "UNSERVED / MONTH (MU)", vals: all.map(r => Math.max(0, +(r.agg.defMU - (r.agg.mktDAM_MU || 0) - (r.agg.mktGDAM_MU || 0) - (r.agg.mktRTM_MU || 0)).toFixed(1))), c: C.neg },
+  ];
+  return (
+    <div>
+      <div style={{ ...mono, fontSize: 10, color: C.t3, marginBottom: 6 }}>
+        Gap = own generation + contracts − demand, BEFORE market purchases. <span style={{ color: C.neg }}>Negative (red)</span> = to be procured from market (up to Market Capability) — beyond that, unserved.
+      </div>
+      <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2, maxHeight: 520 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr>
+            <th style={{ ...thT, textAlign: "left", left: 0, zIndex: 2 }}>HOUR</th>
+            {mtx.map(m => <th key={m.mo} style={thT}>{m.mo}</th>)}
+          </tr></thead>
+          <tbody>
+            {Array.from({ length: 24 }, (_, h) => (
+              <tr key={h}>
+                <td style={rowHd()}>{`${String(h).padStart(2, "0")}:00-${String(h + 1).padStart(2, "0")}:00`}</td>
+                {mtx.map(m => { const v = m.hours[h]; return <td key={m.mo} style={{ ...tdT, background: clr(v), color: v < 0 ? "#FF8A80" : C.t1 }}>{fmt(v)}</td>; })}
+              </tr>
+            ))}
+            {GAP_BANDS.map(([lb, h0, h1]) => (
+              <tr key={lb} style={{ background: C.overlay }}>
+                <td style={rowHd({ color: C.focus, fontWeight: 700, background: C.overlay })}>MIN {lb}</td>
+                {mtx.map(m => { const v = Math.min(...m.hours.slice(h0, h1)); return <td key={m.mo} style={{ ...tdT, color: v < 0 ? C.neg : C.pos, fontWeight: 700 }}>{fmt(v)}</td>; })}
+              </tr>
+            ))}
+            {sumRows.map(sr => (
+              <tr key={sr.lbl} style={{ background: C.base }}>
+                <td style={rowHd({ color: sr.c, fontWeight: 700, background: C.base, ...lbl, fontSize: 9 })}>{sr.lbl}</td>
+                {sr.vals.map((v, i) => <td key={i} style={{ ...tdT, color: sr.c, fontWeight: 600 }}>{typeof v === "number" ? v.toLocaleString("en-IN") : v}</td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Monthly average supply by source category (MW), UP-workbook style
+function SupplyBySourceTable({ all }) {
+  const { data, segs } = useMemo(() => {
+    const types = new Set();
+    const d = all.map(r => {
+      const byType = {};
+      Object.values(r.agg.srcE).forEach(s => { if (s.mw > 0) { byType[s.tp] = (byType[s.tp] || 0) + s.mw; types.add(s.tp); } });
+      const add = (k, v) => { if (v > 0) { byType[k] = v; types.add(k); } };
+      add("FDRE", Math.round(safeMean(r.b96, b => b.fdreMW || 0)));
+      add("STOA", Math.round(safeMean(r.b96, "stoaBuy")));
+      add("DAM", Math.round(safeMean(r.b96, "mktDAM")));
+      add("GDAM", Math.round(safeMean(r.b96, b => b.mktGDAM || 0)));
+      add("RTM", Math.round(safeMean(r.b96, "mktRTM")));
+      byType._total = SEG_ORDER.reduce((s, k) => k === "Charging" ? s : s + (byType[k] || 0), 0);
+      byType._dem = Math.round(safeMean(r.b96, "dem"));
+      byType._pk = r.pk;
+      return { mo: r.mo, byType };
+    });
+    return { data: d, segs: SEG_ORDER.filter(s => s !== "Charging" && types.has(s)) };
+  }, [all]);
+  const fmt = v => (v || 0).toLocaleString("en-IN");
+  return (
+    <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2 }}>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead><tr>
+          <th style={{ ...thT, textAlign: "left", left: 0, zIndex: 2 }}>SOURCE (AVG MW)</th>
+          {data.map(m => <th key={m.mo} style={thT}>{m.mo}</th>)}
+        </tr></thead>
+        <tbody>
+          {segs.map(seg => (
+            <tr key={seg}>
+              <td style={rowHd({ color: SEG_CLR[seg] || C.t1, fontWeight: 600 })}>{seg}</td>
+              {data.map(m => <td key={m.mo} style={{ ...tdT, color: (m.byType[seg] || 0) > 0 ? C.t1 : C.t3 + "66" }}>{fmt(m.byType[seg])}</td>)}
+            </tr>
+          ))}
+          <tr style={{ background: C.overlay }}>
+            <td style={rowHd({ color: C.val, fontWeight: 700, background: C.overlay })}>TOTAL SUPPLY</td>
+            {data.map(m => <td key={m.mo} style={{ ...tdT, color: C.val, fontWeight: 700 }}>{fmt(m.byType._total)}</td>)}
+          </tr>
+          <tr>
+            <td style={rowHd({ color: C.warn, fontWeight: 700 })}>AVG DEMAND</td>
+            {data.map(m => <td key={m.mo} style={{ ...tdT, color: C.warn, fontWeight: 700 }}>{fmt(m.byType._dem)}</td>)}
+          </tr>
+          <tr>
+            <td style={rowHd({ color: C.warn })}>PEAK DEMAND</td>
+            {data.map(m => <td key={m.mo} style={{ ...tdT, color: C.warn }}>{fmt(m.byType._pk)}</td>)}
+          </tr>
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -2684,7 +3335,7 @@ function STOAEditor({ stoa, setStoa, moNames, months }) {
 export default function App() {
   const [plants, setPlants] = useState(DEF_PLANTS);
   const [demand, setDemand] = useState(DEF_DEMAND);
-  const [demandMU, setDemandMU] = useState(Array(12).fill(0)); // monthly energy targets (0 = auto from shape)
+  const [demandMU, setDemandMU] = useState(DEF_DEMAND_MU); // monthly energy — derived from block data when loaded, calibration target otherwise
   const [mkt, setMkt] = useState(DEF_MKT);
   const [uploaded96, setUploaded96] = useState(REF96); // { demand: {calMo: [96]}, dam/rtm/gdam: {calMo: [96]} } — preloaded with the built-in reference dataset; uploads replace it
   const [stoa, setStoa] = useState(DEF_STOA);
@@ -2694,6 +3345,9 @@ export default function App() {
   const [res, setRes] = useState("hourly");
   const [mo, setMo] = useState(2);
   const [tab, setTab] = useState("overview");
+  const [balSc, setBalSc] = useState("base"); // Balance page scenario filter
+  const [bankProp, setBankProp] = useState(DEF_BANK_PROP); // Banking proposal under evaluation
+  const [bankSc, setBankSc] = useState("base"); // Banking page scenario selector
   const [sideOpen, setSideOpen] = useState(true);
   const [startMo, setStartMo] = useState(DEF_START);
 
@@ -2710,13 +3364,16 @@ export default function App() {
 
   const scenarioResults = useMemo(() => {
     return scenarios.filter(s => s.active).map(sc => {
-      let demMU = 0, costCr = 0, mktMU = 0, curtailMU = 0, genMU = 0;
+      let demMU = 0, costCr = 0, mktMU = 0, curtailMU = 0, genMU = 0, surMU = 0, unsMU = 0, pkMax = 0;
       months.forEach((m, i) => {
         const b96 = dispatch96(plants, demand[m.cal], m.cal, stoa, mkt, fdre, sc, m.cal, m.days, uploaded96, demandMU[m.cal] || 0);
         const agg = aggMonthly(b96, m.days);
         demMU += agg.demMU; costCr += agg.costCr; mktMU += agg.mktMU; curtailMU += (agg.curtailMU || 0); genMU += agg.genMU;
+        surMU += (agg.surMU || 0);
+        unsMU += Math.max(0, agg.defMU - (agg.mktDAM_MU || 0) - (agg.mktGDAM_MU || 0) - (agg.mktRTM_MU || 0));
+        pkMax = Math.max(pkMax, safeMax(b96, "dem"));
       });
-      return { ...sc, demMU: Math.round(demMU), costCr: +costCr.toFixed(1), mktMU: Math.round(mktMU), curtailMU: +curtailMU.toFixed(1), genMU: Math.round(genMU), avgCost: demMU > 0 ? +(costCr * 100 / (demMU * 10)).toFixed(2) : 0 };
+      return { ...sc, demMU: Math.round(demMU), costCr: +costCr.toFixed(1), mktMU: Math.round(mktMU), curtailMU: +curtailMU.toFixed(1), genMU: Math.round(genMU), surMU: Math.round(surMU), unsMU: +unsMU.toFixed(1), pkMax: Math.round(pkMax), avgCost: demMU > 0 ? +(costCr * 100 / (demMU * 10)).toFixed(2) : 0 };
     });
   }, [plants, demand, demandMU, stoa, mkt, fdre, scenarios, months, uploaded96]);
 
@@ -2783,6 +3440,84 @@ export default function App() {
     return results;
   }, [isDaily, R, mo, months, demand, demandMU, plants, stoa, mkt, fdre, uploaded96]);
 
+  // ── Balance page scenario filter: recompute the full year under the selected scenario ──
+  const balScenario = useMemo(() => scenarios.find(s => s.id === balSc) || scenarios[0], [scenarios, balSc]);
+  const allBal = useMemo(() => {
+    const sc = balScenario;
+    const isBase = !sc || sc.id === "base";
+    if (isBase) return all;
+    return months.map((m, i) => {
+      const b96 = dispatch96(plants, demand[m.cal], m.cal, stoa, mkt, fdre, sc, m.cal, m.days, uploaded96, demandMU[m.cal] || 0);
+      const agg = aggMonthly(b96, m.days);
+      return { mo: m.name, mi: i, cal: m.cal, days: m.days, pk: Math.round(safeMax(b96, "dem")), b96, agg };
+    });
+  }, [all, balScenario, plants, demand, demandMU, stoa, mkt, fdre, months, uploaded96]);
+  const RB = allBal[mo];
+
+  // Banking page: its own scenario selection (reuses base/Balance results when they coincide)
+  const bankScenario = useMemo(() => scenarios.find(s => s.id === bankSc) || scenarios[0], [scenarios, bankSc]);
+  const allBank = useMemo(() => {
+    if (!bankScenario || bankScenario.id === "base") return all;
+    if (bankScenario.id === balSc) return allBal;
+    return months.map((m, i) => {
+      const b96 = dispatch96(plants, demand[m.cal], m.cal, stoa, mkt, fdre, bankScenario, m.cal, m.days, uploaded96, demandMU[m.cal] || 0);
+      const agg = aggMonthly(b96, m.days);
+      return { mo: m.name, mi: i, cal: m.cal, days: m.days, pk: Math.round(safeMax(b96, "dem")), b96, agg };
+    });
+  }, [all, allBal, balSc, bankScenario, plants, demand, demandMU, stoa, mkt, fdre, months, uploaded96]);
+
+  // ── Results export: multi-sheet XLSX for the selected Balance scenario ──
+  const exportXLSX = useCallback(() => {
+    const wb = XLSX.utils.book_new();
+    const scName = balScenario?.name || "Base Case";
+    const unsOf = (agg) => Math.max(0, +(agg.defMU - (agg.mktDAM_MU || 0) - (agg.mktGDAM_MU || 0) - (agg.mktRTM_MU || 0)).toFixed(1));
+    // 1. Monthly summary
+    const sum = [["Month", "Peak MW", "Demand MU", "Own Gen MU", "FDRE MU", "STOA MU", "DAM MU", "GDAM MU", "RTM MU", "Surplus MU", "Unserved MU", "Curtail MU", "Total Cost Cr", "Avg Rs/kWh"]];
+    allBal.forEach(r => sum.push([r.mo, r.pk, r.agg.demMU, r.agg.genMU, r.agg.fdreMU || 0, r.agg.stoaBuyMU, r.agg.mktDAM_MU || 0, r.agg.mktGDAM_MU || 0, r.agg.mktRTM_MU || 0, r.agg.surMU, unsOf(r.agg), r.agg.curtailMU || 0, r.agg.costCr, r.agg.avgCost]));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(sum), "Monthly_Summary");
+    // 2/3. Hourly matrices (month × hour)
+    const mat = (fn) => {
+      const rows = [["Hour", ...allBal.map(r => r.mo)]];
+      for (let h = 0; h < 24; h++) rows.push([`${String(h).padStart(2, "0")}:00-${String(h + 1).padStart(2, "0")}:00`, ...allBal.map(r => Math.round(safeMean(r.b96.slice(h * 4, h * 4 + 4), fn)))]);
+      return rows;
+    };
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(mat(b => b.dem)), "Hourly_Demand_MW");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(mat(b => (b.sur || 0) - (b.def || 0))), "Hourly_Gap_MW");
+    // 4. Supply by source (avg MW)
+    const segRows = [["Source (avg MW)", ...allBal.map(r => r.mo)]];
+    const byTypeAll = allBal.map(r => {
+      const bt = {};
+      Object.values(r.agg.srcE).forEach(s => { if (s.mw > 0) bt[s.tp] = (bt[s.tp] || 0) + s.mw; });
+      bt.FDRE = Math.round(safeMean(r.b96, b => b.fdreMW || 0));
+      bt.STOA = Math.round(safeMean(r.b96, "stoaBuy"));
+      bt.DAM = Math.round(safeMean(r.b96, "mktDAM"));
+      bt.GDAM = Math.round(safeMean(r.b96, b => b.mktGDAM || 0));
+      bt.RTM = Math.round(safeMean(r.b96, "mktRTM"));
+      return bt;
+    });
+    SEG_ORDER.filter(s => s !== "Charging" && byTypeAll.some(bt => (bt[s] || 0) > 0)).forEach(seg => {
+      segRows.push([seg, ...byTypeAll.map(bt => bt[seg] || 0)]);
+    });
+    segRows.push(["TOTAL SUPPLY", ...byTypeAll.map(bt => SEG_ORDER.reduce((s, k) => k === "Charging" ? s : s + (bt[k] || 0), 0))]);
+    segRows.push(["AVG DEMAND", ...allBal.map(r => Math.round(safeMean(r.b96, "dem")))]);
+    segRows.push(["PEAK DEMAND", ...allBal.map(r => r.pk)]);
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(segRows), "Supply_By_Source_MW");
+    // 5. 96-block dispatch of the selected month
+    const R0 = allBal[mo];
+    const dRows = [["Block", "Time", "Demand_MW", ...plants.map(p => p.name), "STOA", "DAM", "GDAM", "RTM", "Charging", "Surplus", "Unserved", "DAM_Rs_kWh", "Cost_Lakh"]];
+    R0.b96.forEach(b => dRows.push([b.t + 1, b.lbl, b.dem, ...plants.map(p => b.src[p.id]?.mw || 0), b.stoaBuy, b.mktDAM, b.mktGDAM || 0, b.mktRTM, b.chg || 0, b.sur, b.unserved || 0, b.damRate, b.cost]));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(dRows), `Dispatch_${R0.mo}`);
+    // 6. Meta
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([
+      ["P-OPT Outlook — Year-Ahead Resource Planning — Results Export"], ["Scenario", scName],
+      ["Demand Forecast", (balScenario?.demandSet || "base").toUpperCase()],
+      ["Multipliers", `dem×${balScenario?.demMult ?? 1} re×${balScenario?.reMult ?? 1} price×${balScenario?.priceMult ?? 1} fuel×${balScenario?.fuelMult ?? 1}`],
+      ["Note", "Costs are variable-only (no fixed charges in plant master)"],
+      ["Generated", new Date().toLocaleString()],
+    ]), "Meta");
+    XLSX.writeFile(wb, `POPT_Outlook_Results_${scName.replace(/[^A-Za-z0-9]+/g, "_")}.xlsx`);
+  }, [allBal, balScenario, plants, mo]);
+
   const exportCSV = useCallback(() => {
     const rows = [["Block", "Time", "Demand_MW", ...plants.map(p => p.name + "_MW"), "STOA_MW", "GDAM_MW", "DAM_MW", "RTM_MW", "Curtail_MW", "Marg_Cost", "Block_Cost_Lakhs"]];
     R.b96.forEach(b => {
@@ -2792,7 +3527,7 @@ export default function App() {
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = `UCED_${R.mo}_dispatch.csv`; a.click();
+    a.href = url; a.download = `POPT_Outlook_${R.mo}_dispatch.csv`; a.click();
     URL.revokeObjectURL(url);
   }, [R, plants]);
 
@@ -2814,7 +3549,7 @@ export default function App() {
           </div>
           <span style={{ ...mono, fontSize: 14, fontWeight: 800, color: C.focus, letterSpacing: 2 }}>P-OPT</span>
         </div>
-        <span style={{ ...lbl, fontSize: 10, color: C.t2 }}>UC/ED</span>
+        <span style={{ ...lbl, fontSize: 10, color: C.t2 }} title="Year-Ahead Resource Planning">OUTLOOK</span>
         <span style={{ ...mono, fontSize: 10, color: C.t3 }}>{yearLabel}</span>
         <div style={{ width: 1, height: 16, background: C.brd, margin: "0 4px" }} />
         {/* Start month picker */}
@@ -2883,15 +3618,16 @@ export default function App() {
 
           {tab === "config" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              <Panel title="96-BLOCK DATA UPLOAD" accent={C.focus}><DataUploader demand={demand} setDemand={setDemand} mkt={mkt} setMkt={setMkt} months={months} moNames={moNames} uploaded96={uploaded96} setUploaded96={setUploaded96} /></Panel>
+              <Panel title="96-BLOCK DATA UPLOAD" accent={C.focus}><DataUploader demand={demand} setDemand={setDemand} mkt={mkt} setMkt={setMkt} months={months} moNames={moNames} uploaded96={uploaded96} setUploaded96={setUploaded96} demandMU={demandMU} setDemandMU={setDemandMU} /></Panel>
               <Panel title="GENERATION PORTFOLIO" accent={C.thermal}><PlantEditor plants={plants} setPlants={setPlants} /></Panel>
+              <Panel title="STORAGE ASSETS — BESS / PSP / PONDAGE HYDRO" accent={SEG_CLR.BESS}><StorageEditor plants={plants} setPlants={setPlants} /></Panel>
               <Panel title="OUTAGE / AVAILABILITY CALENDAR" accent={C.neg}><OutageEditor plants={plants} setPlants={setPlants} moNames={moNames} months={months} /></Panel>
-              <Panel title="MONTHLY PEAK DEMAND & ENERGY" accent={C.warn}><DemandEditor demand={demand} setDemand={setDemand} demandMU={demandMU} setDemandMU={setDemandMU} moNames={moNames} months={months} /></Panel>
-              <Panel title="MARKET PRICES & LIMITS" accent={C.dam}><MarketEditor mkt={mkt} setMkt={setMkt} moNames={moNames} months={months} /></Panel>
+              <Panel title="MONTHLY PEAK DEMAND & ENERGY" accent={C.warn}><DemandEditor demand={demand} setDemand={setDemand} demandMU={demandMU} setDemandMU={setDemandMU} moNames={moNames} months={months} uploaded96={uploaded96} /></Panel>
+              <Panel title="MARKET PRICES & LIMITS" accent={C.dam}><MarketEditor mkt={mkt} setMkt={setMkt} moNames={moNames} months={months} uploaded96={uploaded96} /></Panel>
               <Panel title="STOA CONTRACTS" accent={C.bilat}><STOAEditor stoa={stoa} setStoa={setStoa} moNames={moNames} months={months} /></Panel>
               <Panel title="FDRE CONTRACTS" accent={C.psp}><FDREEditor fdre={fdre} setFdre={setFdre} moNames={moNames} months={months} /></Panel>
               <Panel title="RPO TARGETS" accent={C.pos}><RPOEditor rpo={rpo} setRpo={setRpo} /></Panel>
-              <Panel title="STOCHASTIC SCENARIOS" accent={C.dec}><ScenarioEditor scenarios={scenarios} setScenarios={setScenarios} /></Panel>
+              <Panel title="STOCHASTIC SCENARIOS" accent={C.dec}><ScenarioEditor scenarios={scenarios} setScenarios={setScenarios} uploaded96={uploaded96} /></Panel>
             </div>
           )}
 
@@ -3020,31 +3756,57 @@ export default function App() {
           {tab === "scenarios" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               <Panel title="SCENARIO COMPARISON" accent={C.dec}><ScenarioCompare scenarioResults={scenarioResults} /></Panel>
-              <Panel title="SCENARIO PARAMETERS" accent={C.dec}><ScenarioEditor scenarios={scenarios} setScenarios={setScenarios} /></Panel>
+              <Panel title="SCENARIO PARAMETERS" accent={C.dec}><ScenarioEditor scenarios={scenarios} setScenarios={setScenarios} uploaded96={uploaded96} /></Panel>
             </div>
+          )}
+
+          {tab === "banking" && (
+            <BankingPage allEv={allBank} evScenario={bankScenario} scenarios={scenarios} bankSc={bankSc} setBankSc={setBankSc} bankProp={bankProp} setBankProp={setBankProp} stoa={stoa} moNames={moNames} months={months} setTab={setTab} />
           )}
 
           {tab === "balance" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {/* Scenario filter + results export */}
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", background: C.panel, border: `1px solid ${C.brd}`, borderRadius: 2, padding: "6px 10px" }}>
+                <span style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2 }}>SCENARIO</span>
+                {scenarios.filter(s => s.active).map(s => (
+                  <button key={s.id} onClick={() => setBalSc(s.id)} style={{
+                    ...lbl, fontSize: 10, padding: "3px 10px", borderRadius: 2, cursor: "pointer",
+                    border: balSc === s.id ? `1px solid ${s.color}` : `1px solid ${C.brd}88`,
+                    background: balSc === s.id ? s.color + "22" : C.elev,
+                    color: balSc === s.id ? s.color : C.t1, fontWeight: balSc === s.id ? 700 : 500,
+                  }}>{s.name}</button>
+                ))}
+                {balScenario && balScenario.demandSet && balScenario.demandSet !== "base" && (
+                  <span style={{ ...mono, fontSize: 9, color: balScenario.demandSet === "high" ? C.neg : C.pos }}>[{balScenario.demandSet.toUpperCase()} FORECAST]</span>
+                )}
+                <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                  <button onClick={exportXLSX} style={{ ...lbl, fontSize: 10, padding: "3px 12px", borderRadius: 2, border: `1px solid ${C.pos}44`, cursor: "pointer", background: C.pos + "15", color: C.pos, fontWeight: 600 }}>⬇ XLSX RESULTS</button>
+                  <button onClick={() => window.print()} title="Use the browser print dialog → Save as PDF" style={{ ...lbl, fontSize: 10, padding: "3px 12px", borderRadius: 2, border: `1px solid ${C.brd}`, cursor: "pointer", background: C.elev, color: C.t1 }}>⎙ PDF</button>
+                </div>
+              </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 6 }}>
-                <KPI label={`${R.mo} Demand`} value={R.agg.demMU} unit="MU" accent={C.warn} />
-                <KPI label="Own Gen" value={R.agg.genMU} unit="MU" color={C.pos} accent={C.pos} />
-                <KPI label="Market" value={R.agg.mktMU} unit="MU" color={C.dam} accent={C.dam} />
-                <KPI label="STOA" value={R.agg.stoaBuyMU} unit="MU" color={C.bilat} accent={C.bilat} />
-                <KPI label="FDRE" value={R.agg.fdreMU || 0} unit="MU" color={C.psp} accent={C.psp} />
-                <KPI label="Curtail" value={R.agg.curtailMU || 0} unit="MU" color={(R.agg.curtailMU || 0) > 0 ? C.curtail : C.pos} accent={(R.agg.curtailMU || 0) > 0 ? C.curtail : C.pos} />
+                <KPI label={`${RB.mo} Demand`} value={RB.agg.demMU} unit="MU" accent={C.warn} />
+                <KPI label="Own Gen" value={RB.agg.genMU} unit="MU" color={C.pos} accent={C.pos} />
+                <KPI label="Market" value={RB.agg.mktMU} unit="MU" color={C.dam} accent={C.dam} />
+                <KPI label="STOA" value={RB.agg.stoaBuyMU} unit="MU" color={C.bilat} accent={C.bilat} />
+                <KPI label="FDRE" value={RB.agg.fdreMU || 0} unit="MU" color={C.psp} accent={C.psp} />
+                <KPI label="Curtail" value={RB.agg.curtailMU || 0} unit="MU" color={(RB.agg.curtailMU || 0) > 0 ? C.curtail : C.pos} accent={(RB.agg.curtailMU || 0) > 0 ? C.curtail : C.pos} />
                 {(() => {
-                  const u = Math.max(0, +(R.agg.defMU - (R.agg.mktDAM_MU || 0) - (R.agg.mktGDAM_MU || 0) - (R.agg.mktRTM_MU || 0)).toFixed(1));
+                  const u = Math.max(0, +(RB.agg.defMU - (RB.agg.mktDAM_MU || 0) - (RB.agg.mktGDAM_MU || 0) - (RB.agg.mktRTM_MU || 0)).toFixed(1));
                   return <KPI label="Unserved" value={u} unit="MU" color={u > 0 ? C.neg : C.pos} accent={u > 0 ? C.neg : C.pos} />;
                 })()}
-                <KPI label="Cost" value={R.agg.costCr} unit="Cr" color={C.neg} accent={C.neg} />
+                <KPI label="Cost" value={RB.agg.costCr} unit="Cr" color={C.neg} accent={C.neg} />
               </div>
-              {isDaily ? <Panel title={`${R.mo} DAILY BALANCE`} accent={C.focus}><DailyView dailyData={dailyData} moName={R.mo} /></Panel> : (
+              {isDaily ? <Panel title={`${R.mo} DAILY BALANCE${balSc !== "base" ? " — BASE CASE (daily view does not apply the scenario filter)" : ""}`} accent={C.focus}><DailyView dailyData={dailyData} moName={R.mo} /></Panel> : (
                 <>
-                  <Panel title="MONTHLY NET POSITION" accent={C.info}><NetPositionChart all={all} /></Panel>
-                  <Panel title="SURPLUS-DEFICIT HEATMAP — MONTH × HOUR" accent={C.focus}><BalanceHeatmap all={all} /></Panel>
-                  <Panel title="CAPACITY ADEQUACY vs PEAK" accent={C.thermal}><CapacityAdequacyChart all={all} plants={plants} /></Panel>
-                  <Panel title="COST OF BALANCE" accent={C.neg}><CostBalanceChart all={all} /></Panel>
+                  <Panel title="MONTHLY NET POSITION" accent={C.info}><NetPositionChart all={allBal} /></Panel>
+                  <Panel title="SURPLUS-DEFICIT HEATMAP — MONTH × HOUR" accent={C.focus}><BalanceHeatmap all={allBal} /></Panel>
+                  <Panel title="HOURLY SUPPLY-DEMAND GAP TABLE — MW" accent={C.info}><HourlyGapTable all={allBal} plants={plants} mkt={mkt} /></Panel>
+                  <Panel title="HOURLY DEMAND TABLE — MW" accent={C.warn} defaultOpen={false}><HourlyDemandTable all={allBal} /></Panel>
+                  <Panel title="MONTHLY SUPPLY BY SOURCE — AVG MW" accent={C.thermal}><SupplyBySourceTable all={allBal} /></Panel>
+                  <Panel title="CAPACITY ADEQUACY vs PEAK" accent={C.thermal}><CapacityAdequacyChart all={allBal} plants={plants} /></Panel>
+                  <Panel title="COST OF BALANCE" accent={C.neg}><CostBalanceChart all={allBal} /></Panel>
                 </>
               )}
             </div>
@@ -3063,7 +3825,7 @@ export default function App() {
           RPO {(rpoData.totMU > 0 ? rpoData.fulfilled?.total / rpoData.totMU * 100 : 0).toFixed(1)}%
         </span>
         <span style={{ ...mono, fontSize: 10, color: C.t2 }}>{R.mo} | Pk {R.pk}MW | Rs{R.agg.avgCost}/kWh</span>
-        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT UCED v4.5 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
+        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT OUTLOOK v5.6 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
       </div>
     </div>
   );
