@@ -647,11 +647,14 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
     // day actually work (the old priority-ordered Phases A/B capped daily discharge near
     // the INITIAL stored energy and only charged "what discharge needed" — a BESS could
     // charge once and never discharge, while curtailed energy went unabsorbed).
-    // Behaviour per block, in priority order:
+    // Behaviour per block, in priority order (AUTO mode):
     //   discharge into physical deficit → charge from physical surplus (CURTAILMENT-FIRST:
     //   that energy is otherwise spilled, i.e. free) → discharge into expensive-arb blocks
     //   → charge from cheap-arb blocks. Ramps, charge↔discharge transition cooldown, SoC
     //   band and daily cycle budget enforced inline.
+    // MANUAL mode: user-specified scheduleHours[0..23] → -1 charge, +1 discharge, 0 idle.
+    const isManualSch = !!(p.manualSchedule && p.scheduleHours);
+    const manualHrs = isManualSch ? p.scheduleHours : null;
     const schedule = Array(96).fill(0); // MW at each block (+discharge, -charge)
     let soc = (socMaxPct + socMinPct) / 2; // start at mid-SoC
     let cycleUsed = 0; // MWh discharged
@@ -663,14 +666,23 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
       const canDis = soc > socMinPct + 0.01 && cycleUsed < cycleBudgetMWh - 0.01;
       const canChg = soc < socMaxPct - 0.01;
 
-      // Priority: real deficit → price-expensive (discharge displaces surplus sales at the
-      // HIGH price, so it beats absorbing surplus in the same block — in all-surplus months
-      // the reverse ordering charges forever and never discharges) → physical surplus → cheap.
       let target = 0;
-      if (bc.isDeficit && canDis) target = Math.min(maxDischargeRate, Math.max(1, bc.deficitMW));
-      else if (bc.mktExpensive && canDis) target = maxDischargeRate;
-      else if (bc.isSurplus && canChg) target = -Math.min(maxChargeRate, Math.max(1, bc.surplusMW));
-      else if (bc.mktCheap && canChg) target = -maxChargeRate;
+      if (isManualSch) {
+        // Manual schedule: user-specified hours drive charge/discharge
+        const hrCmd = manualHrs[Math.floor(t / 4)] || 0;
+        if (hrCmd === 1 && canDis) target = maxDischargeRate;       // discharge / generate
+        else if (hrCmd === -1 && canChg) target = -maxChargeRate;   // charge
+        // hrCmd === 0 → idle, target stays 0
+      } else {
+        // Auto mode: priority-based optimisation
+        // Priority: real deficit → price-expensive (discharge displaces surplus sales at the
+        // HIGH price, so it beats absorbing surplus in the same block — in all-surplus months
+        // the reverse ordering charges forever and never discharges) → physical surplus → cheap.
+        if (bc.isDeficit && canDis) target = Math.min(maxDischargeRate, Math.max(1, bc.deficitMW));
+        else if (bc.mktExpensive && canDis) target = maxDischargeRate;
+        else if (bc.isSurplus && canChg) target = -Math.min(maxChargeRate, Math.max(1, bc.surplusMW));
+        else if (bc.mktCheap && canChg) target = -maxChargeRate;
+      }
       if (target === 0) { prevPower = 0; prevState = prevState; schedule[t] = 0; continue; }
 
       // Charge↔discharge transition cooldown
@@ -1470,17 +1482,27 @@ function StorageEditor({ plants, setPlants }) {
   const addStor = (tp) => {
     const id = Math.max(0, ...plants.map(p => p.id)) + 1;
     const base = tp === "BESS"
-      ? { id, name: `BESS ${id}`, type: "BESS", fuel: "none", pMax: 100, pMin: 0, ecr: 0, fixedCost: 0, startCost: 0, avail: 95, mustRun: false, rampUp: 100, rampDn: 100, minUp: 0, minDn: 0, mwh: 400, eff: 88, socMin: 10, socMax: 90, cycles: 1, transitionMins: 5, degradCost: 0.5 }
-      : { id, name: `PSP ${id}`, type: "PSP", fuel: "none", pMax: 200, pMin: 0, ecr: 0, fixedCost: 0, startCost: 0, avail: 90, mustRun: false, rampUp: 30, rampDn: 30, minUp: 2, minDn: 2, mwh: 1200, eff: 78, socMin: 5, socMax: 95, storageHrs: 6, transitionMins: 15, degradCost: 0.1 };
+      ? { id, name: `BESS ${id}`, type: "BESS", fuel: "none", pMax: 100, pMin: 0, ecr: 0, fixedCost: 0, startCost: 0, avail: 95, mustRun: false, rampUp: 100, rampDn: 100, minUp: 0, minDn: 0, mwh: 400, eff: 88, socMin: 10, socMax: 90, cycles: 1, transitionMins: 5, degradCost: 0.5, manualSchedule: false, scheduleHours: null }
+      : { id, name: `PSP ${id}`, type: "PSP", fuel: "none", pMax: 200, pMin: 0, ecr: 0, fixedCost: 0, startCost: 0, avail: 90, mustRun: false, rampUp: 30, rampDn: 30, minUp: 2, minDn: 2, mwh: 1200, eff: 78, socMin: 5, socMax: 95, storageHrs: 6, transitionMins: 15, degradCost: 0.1, manualSchedule: false, scheduleHours: null };
     setPlants(prev => [...prev, base]);
   };
   const capOf = (p) => p.mwh || (p.type === "Hydro" ? (p.storageHrs || 6) * p.pMax : 0);
+  // Toggle hour in scheduleHours: cycle idle(0) → charge(-1) → discharge(1) → idle
+  const toggleHour = (id, h) => setPlants(prev => prev.map(p => {
+    if (p.id !== id) return p;
+    const arr = p.scheduleHours ? [...p.scheduleHours] : Array(24).fill(0);
+    arr[h] = arr[h] === 0 ? -1 : arr[h] === -1 ? 1 : 0;
+    return { ...p, scheduleHours: arr };
+  }));
+  const clearSchedule = (id) => setPlants(prev => prev.map(p => p.id === id ? { ...p, scheduleHours: Array(24).fill(0) } : p));
+  const hrCell = { width: 20, height: 20, display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer", borderRadius: 2, fontSize: 8, fontWeight: 700, border: "1px solid transparent", transition: "background 0.1s" };
+
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
         <button onClick={() => addStor("BESS")} style={{ ...lbl, fontSize: 10, padding: "3px 10px", background: SEG_CLR.BESS + "15", color: SEG_CLR.BESS, border: `1px solid ${SEG_CLR.BESS}33`, borderRadius: 2, cursor: "pointer" }}>+ ADD BESS</button>
         <button onClick={() => addStor("PSP")} style={{ ...lbl, fontSize: 10, padding: "3px 10px", background: SEG_CLR.PSP + "15", color: SEG_CLR.PSP, border: `1px solid ${SEG_CLR.PSP}33`, borderRadius: 2, cursor: "pointer" }}>+ ADD PSP</button>
-        <span style={{ ...mono, fontSize: 10, color: C.t3, marginLeft: "auto" }}>Charges on surplus / cheap-market blocks, discharges on deficit / expensive blocks — cycle- &amp; SoC-limited</span>
+        <span style={{ ...mono, fontSize: 10, color: C.t3, marginLeft: "auto" }}>Auto mode: optimises for market prices. Manual: user-specified charge/discharge hours.</span>
       </div>
       {stor.length === 0 ? (
         <div style={{ ...ui, fontSize: 11, color: C.t3, padding: 12, textAlign: "center", border: `1px dashed ${C.brd}`, borderRadius: 3 }}>
@@ -1490,42 +1512,85 @@ function StorageEditor({ plants, setPlants }) {
         <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2 }}>
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead><tr>
-              {["", "Name", "Type", "Power MW", "Charge MW", "Energy MWh", "Hrs", "RT Eff %", "SoC Min %", "SoC Max %", "Cycles/day", "Trans min", "Degrad ₹/kWh", "Avail %"].map((h, i) => (
+              {["", "Name", "Type", "Power MW", "Charge MW", "Energy MWh", "Hrs", "RT Eff %", "SoC Min %", "SoC Max %", "Cycles/day", "Trans min", "Degrad ₹/kWh", "Ramp Up", "Ramp Dn", "Avail %", "Mode"].map((h, i) => (
                 <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "6px 5px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 2 ? "right" : "left", whiteSpace: "nowrap" }}>{h}</th>
               ))}
             </tr></thead>
             <tbody>{stor.map((p, ri) => {
               const cap = capOf(p);
               const isHyd = p.type === "Hydro";
+              const isManual = !!p.manualSchedule;
+              const schArr = p.scheduleHours || Array(24).fill(0);
+              const bgRow = ri % 2 === 0 ? C.elev : C.elev + "99";
               return (
-                <tr key={p.id} style={{ background: ri % 2 === 0 ? C.elev : C.elev + "99" }}>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15` }}><button onClick={() => delStor(p.id)} style={{ background: "none", border: "none", color: C.neg, cursor: "pointer", fontSize: 12 }}>x</button></td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15` }}><EditCell value={p.name} onChange={v => update(p.id, "name", v)} type="text" width={90} /></td>
-                  <td style={{ ...ui, fontSize: 10, padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, color: FC[p.type] || C.t1 }}>{isHyd ? "Hydro (pondage)" : p.type}</td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.pMax} onChange={v => update(p.id, "pMax", v)} type="number" min={0} width={40} /></td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.maxChargeRate || p.pMax} onChange={v => update(p.id, "maxChargeRate", v)} type="number" min={0} width={40} /></td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
-                    {isHyd ? <span style={{ ...mono, fontSize: 11, color: C.t2 }} title="Derived: storage hrs × MW">{cap}</span>
+                <React.Fragment key={p.id}>
+                <tr style={{ background: bgRow }}>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15` }}><button onClick={() => delStor(p.id)} style={{ background: "none", border: "none", color: C.neg, cursor: "pointer", fontSize: 12 }}>x</button></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15` }}><EditCell value={p.name} onChange={v => update(p.id, "name", v)} type="text" width={90} /></td>
+                  <td style={{ ...ui, fontSize: 10, padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, color: FC[p.type] || C.t1 }}>{isHyd ? "Hydro (pondage)" : p.type}</td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.pMax} onChange={v => update(p.id, "pMax", v)} type="number" min={0} width={40} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.maxChargeRate || p.pMax} onChange={v => update(p.id, "maxChargeRate", v)} type="number" min={0} width={40} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}>
+                    {isHyd ? <span style={{ ...mono, fontSize: 11, color: C.t2 }} title="Derived: storage hrs x MW">{cap}</span>
                       : <EditCell value={p.mwh || 0} onChange={v => update(p.id, "mwh", v)} type="number" min={0} width={40} />}
                   </td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}>
                     {isHyd ? <EditCell value={p.storageHrs || 6} onChange={v => update(p.id, "storageHrs", v)} type="number" min={0} max={24} width={30} />
                       : <span style={{ ...mono, fontSize: 10, color: C.t3 }}>{p.pMax > 0 ? (cap / p.pMax).toFixed(1) : "—"}</span>}
                   </td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.eff || (isHyd ? 90 : 85)} onChange={v => update(p.id, "eff", v)} type="number" min={1} max={100} width={30} /></td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.socMin ?? 5} onChange={v => update(p.id, "socMin", v)} type="number" min={0} max={100} width={30} /></td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.socMax ?? 95} onChange={v => update(p.id, "socMax", v)} type="number" min={0} max={100} width={30} /></td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.eff || (isHyd ? 90 : 85)} onChange={v => update(p.id, "eff", v)} type="number" min={1} max={100} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.socMin ?? 5} onChange={v => update(p.id, "socMin", v)} type="number" min={0} max={100} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.socMax ?? 95} onChange={v => update(p.id, "socMax", v)} type="number" min={0} max={100} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}>
                     {p.type === "BESS" ? (
                       <select value={p.cycles || 1} onChange={e => update(p.id, "cycles", parseFloat(e.target.value))} style={{ ...ui, fontSize: 10, background: C.overlay, color: C.t1, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 2px", cursor: "pointer", width: 42 }}>
                         {[1, 1.5, 2, 2.5, 3].map(c => <option key={c} value={c}>{c}</option>)}
                       </select>
                     ) : <span style={{ ...mono, fontSize: 10, color: C.t3 }} title="Unlimited">∞</span>}
                   </td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.transitionMins || 0} onChange={v => update(p.id, "transitionMins", v)} type="number" min={0} max={60} width={30} /></td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.degradCost || 0} onChange={v => update(p.id, "degradCost", v)} type="number" min={0} width={35} /></td>
-                  <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.avail ?? 95} onChange={v => update(p.id, "avail", v)} type="number" min={0} max={100} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.transitionMins || 0} onChange={v => update(p.id, "transitionMins", v)} type="number" min={0} max={60} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.degradCost || 0} onChange={v => update(p.id, "degradCost", v)} type="number" min={0} width={35} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.rampUp ?? 999} onChange={v => update(p.id, "rampUp", v)} type="number" min={0} width={35} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.rampDn ?? p.rampUp ?? 999} onChange={v => update(p.id, "rampDn", v)} type="number" min={0} width={35} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}><EditCell value={p.avail ?? 95} onChange={v => update(p.id, "avail", v)} type="number" min={0} max={100} width={30} /></td>
+                  <td style={{ padding: "3px 4px", borderBottom: isManual ? "none" : `1px solid ${C.brd}15`, textAlign: "right" }}>
+                    <select value={isManual ? "manual" : "auto"} onChange={e => { const m = e.target.value === "manual"; update(p.id, "manualSchedule", m); if (m && !p.scheduleHours) update(p.id, "scheduleHours", Array(24).fill(0)); }}
+                      style={{ ...lbl, fontSize: 9, background: isManual ? C.focus + "22" : C.overlay, color: isManual ? C.focus : C.t2, border: `1px solid ${isManual ? C.focus + "44" : C.brd}`, borderRadius: 3, padding: "2px 4px", cursor: "pointer", fontWeight: 600 }}>
+                      <option value="auto">AUTO</option>
+                      <option value="manual">MANUAL</option>
+                    </select>
+                  </td>
                 </tr>
+                {isManual && (
+                  <tr style={{ background: bgRow }}>
+                    <td colSpan={17} style={{ padding: "2px 8px 8px", borderBottom: `1px solid ${C.brd}15` }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                        <span style={{ ...lbl, fontSize: 9, color: C.t3, minWidth: 60 }}>SCHEDULE</span>
+                        <div style={{ display: "flex", gap: 1 }}>
+                          {schArr.map((v, h) => {
+                            const bg = v === -1 ? C.focus : v === 1 ? C.pos : C.overlay;
+                            const fg = v === 0 ? C.t3 : "#fff";
+                            const sym = v === -1 ? "▼" : v === 1 ? "▲" : "";
+                            return <div key={h} onClick={() => toggleHour(p.id, h)} title={`${String(h).padStart(2,"0")}:00 — ${v === -1 ? "Charge" : v === 1 ? (isHyd ? "Generate" : "Discharge") : "Idle"} (click to cycle)`}
+                              style={{ ...hrCell, background: bg, color: fg, border: `1px solid ${bg === C.overlay ? C.brd : bg}` }}>
+                              <span style={{ fontSize: 7 }}>{sym || h}</span>
+                            </div>;
+                          })}
+                        </div>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <span style={{ ...lbl, fontSize: 8, color: C.focus }}>&#9660; CHG</span>
+                          <span style={{ ...lbl, fontSize: 8, color: C.pos }}>&#9650; {isHyd ? "GEN" : "DIS"}</span>
+                          <span style={{ ...lbl, fontSize: 8, color: C.t3 }}>&#183; IDLE</span>
+                          <button onClick={() => clearSchedule(p.id)} style={{ ...lbl, fontSize: 8, padding: "1px 6px", borderRadius: 2, border: `1px solid ${C.brd}`, background: C.overlay, color: C.t3, cursor: "pointer" }}>CLR</button>
+                        </div>
+                        <span style={{ ...mono, fontSize: 9, color: C.t3 }}>
+                          Chg: {schArr.filter(v => v === -1).length}h | {isHyd ? "Gen" : "Dis"}: {schArr.filter(v => v === 1).length}h
+                        </span>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
               );
             })}</tbody>
           </table>
@@ -4398,6 +4463,7 @@ function ForecastTab({ plants, demand, demandMU, stoa, mkt, fdre, uploaded96 }) 
   const [fcData, setFcData] = useState(null);
   const [fcResults, setFcResults] = useState(null);
   const [running, setRunning] = useState(false);
+  const [selDay, setSelDay] = useState(0);
   const fileRef = useRef(null);
 
   // Parse a cell as a date → YYYY-MM-DD string or null
@@ -4636,7 +4702,23 @@ function ForecastTab({ plants, demand, demandMU, stoa, mkt, fdre, uploaded96 }) 
       srcRows.push(row);
     });
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(srcRows), "Supply_By_Source_MW");
-    // 5. Meta
+    // 5. Block-wise dispatch (96 blocks × all days — full resolution)
+    const blkRows = [["Date", "Day", "Block", "Demand MW", "Gen MW", "FDRE MW", "STOA MW", "DAM MW", "GDAM MW", "RTM MW", "Own Supply MW", "Total Supply MW", "Surplus MW", "Deficit MW", "Curtail MW", "Own−Dem Gap MW", "Unserved MW", "Charging MW", "Cost ₹Lakhs"]];
+    fcResults.forEach(r => {
+      r.b96.forEach((b, t) => {
+        const own = (b.gen || 0) + (b.fdreMW || 0) + (b.stoaBuy || 0);
+        const mkt = (b.mktDAM || 0) + (b.mktGDAM || 0) + (b.mktRTM || 0);
+        blkRows.push([r.dateStr, r.dow, TB[t].lbl,
+          Math.round(b.dem || 0), Math.round(b.gen || 0), Math.round(b.fdreMW || 0), Math.round(b.stoaBuy || 0),
+          Math.round(b.mktDAM || 0), Math.round(b.mktGDAM || 0), Math.round(b.mktRTM || 0),
+          Math.round(own), Math.round(own + mkt),
+          Math.round(b.sur || 0), Math.round(b.def || 0), Math.round(b.curtailment || 0),
+          Math.round(own - (b.dem || 0)), Math.round(b.unserved || 0), Math.round(b.chg || 0),
+          +((b.cost || 0)).toFixed(2)]);
+      });
+    });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(blkRows), "Block_Dispatch_96");
+    // 6. Meta
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([
       ["P-OPT Outlook — Simulate_TB Results"],
       ["Period", `${fcResults[0].dateStr} to ${fcResults[fcResults.length - 1].dateStr}`],
@@ -4762,9 +4844,9 @@ function ForecastTab({ plants, demand, demandMU, stoa, mkt, fdre, uploaded96 }) 
             </Panel>
           )}
 
-          {/* Supply-Demand & Gap table (avg MW per day) */}
-          <Panel title="SUPPLY-DEMAND & GAP (AVG MW)">
-            <div style={{ overflow: "auto", maxHeight: 560, border: `1px solid ${C.brd}`, borderRadius: 6 }}>
+          {/* Daily summary table (avg MW per day) */}
+          <Panel title="DAILY SUMMARY (AVG MW)" defaultOpen={false}>
+            <div style={{ overflow: "auto", maxHeight: 460, border: `1px solid ${C.brd}`, borderRadius: 6 }}>
               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                 <thead style={{ position: "sticky", top: 0, zIndex: 3 }}>
                   <tr style={{ background: C.base }}>
@@ -4785,7 +4867,8 @@ function ForecastTab({ plants, demand, demandMU, stoa, mkt, fdre, uploaded96 }) 
                   </tr>
                 </thead>
                 <tbody>{fcResults.map(r => (
-                  <tr key={r.dateStr} style={{ background: r.isWeekend ? C.overlay : "transparent" }}>
+                  <tr key={r.dateStr} style={{ background: r.isWeekend ? C.overlay : "transparent", cursor: "pointer" }}
+                    onClick={() => setSelDay(fcResults.indexOf(r))}>
                     <td style={{ ...tdS, textAlign: "left", color: C.t1 }}>{r.dateStr}</td>
                     <td style={{ ...tdS, textAlign: "left", color: r.isWeekend ? C.warn : C.t2, fontSize: 10 }}>{r.dow}</td>
                     <td style={{ ...tdS, color: C.warn, borderRight: `1px solid ${C.brd}44` }}>{r.pk}</td>
@@ -4811,6 +4894,79 @@ function ForecastTab({ plants, demand, demandMU, stoa, mkt, fdre, uploaded96 }) 
               </table>
             </div>
           </Panel>
+
+          {/* Block-wise (96-block) output — full resolution */}
+          {(() => {
+            const dayIdx = Math.min(selDay, fcResults.length - 1);
+            const r = fcResults[dayIdx];
+            const b96 = r.b96;
+            return (
+              <Panel title="BLOCK-WISE DISPATCH (96 BLOCKS × ALL DAYS)" accent={C.focus}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+                  <span style={{ ...lbl, fontSize: 10, color: C.t3 }}>SELECT DATE</span>
+                  <select value={dayIdx} onChange={e => setSelDay(+e.target.value)}
+                    style={{ ...mono, fontSize: 11, padding: "4px 8px", borderRadius: 3, border: `1px solid ${C.brd}`, background: C.overlay, color: C.val, cursor: "pointer" }}>
+                    {fcResults.map((d, i) => <option key={i} value={i}>{d.dateStr} ({d.dow})</option>)}
+                  </select>
+                  <button onClick={() => setSelDay(Math.max(0, dayIdx - 1))} disabled={dayIdx === 0}
+                    style={{ ...lbl, fontSize: 10, padding: "3px 8px", borderRadius: 2, border: `1px solid ${C.brd}`, cursor: dayIdx === 0 ? "not-allowed" : "pointer", background: C.overlay, color: C.t2, opacity: dayIdx === 0 ? 0.4 : 1 }}>◀ PREV</button>
+                  <button onClick={() => setSelDay(Math.min(fcResults.length - 1, dayIdx + 1))} disabled={dayIdx >= fcResults.length - 1}
+                    style={{ ...lbl, fontSize: 10, padding: "3px 8px", borderRadius: 2, border: `1px solid ${C.brd}`, cursor: dayIdx >= fcResults.length - 1 ? "not-allowed" : "pointer", background: C.overlay, color: C.t2, opacity: dayIdx >= fcResults.length - 1 ? 0.4 : 1 }}>NEXT ▶</button>
+                  <span style={{ ...mono, fontSize: 11, color: C.t2 }}>Peak {r.pk} MW | {r.agg.demMU} MU | ₹{r.agg.costCr} Cr | Rs{r.agg.avgCost}/kWh</span>
+                </div>
+                <div style={{ overflow: "auto", maxHeight: 600, border: `1px solid ${C.brd}`, borderRadius: 6 }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead style={{ position: "sticky", top: 0, zIndex: 3 }}>
+                      <tr style={{ background: C.base }}>
+                        <th colSpan={1} style={{ ...thS, textAlign: "left", borderRight: `1px solid ${C.brd}` }}></th>
+                        {thGrp("DEMAND", 1, C.warn)}
+                        {thGrp("—— OWN SUPPLY ——", 3, C.pos)}
+                        {thGrp("—— MARKET ——", 3, C.focus)}
+                        {thGrp("TOTAL", 1, C.t1)}
+                        {thGrp("—— GAP ——", 4, C.neg)}
+                        {thGrp("COST", 1, C.val)}
+                      </tr>
+                      <tr>
+                        {["Block", "Dem", "Gen", "FDRE", "STOA", "DAM", "GDAM", "RTM", "Total", "Sur", "Def", "Curt", "Gap", "₹L"].map((h, i) => (
+                          <th key={i} style={{ ...thS, textAlign: i === 0 ? "left" : "right",
+                            borderRight: (i === 0 || i === 1 || i === 4 || i === 7 || i === 8 || i === 12) ? `1px solid ${C.brd}44` : "none",
+                          }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>{b96.map((b, t) => {
+                      const own = (b.gen || 0) + (b.fdreMW || 0) + (b.stoaBuy || 0);
+                      const mkt = (b.mktDAM || 0) + (b.mktGDAM || 0) + (b.mktRTM || 0);
+                      const total = own + mkt;
+                      const gap = Math.round(own - (b.dem || 0));
+                      const isPeak = t >= PK0 && t <= PK1;
+                      return (
+                        <tr key={t} style={{ background: isPeak ? C.overlay : "transparent" }}>
+                          <td style={{ ...tdS, textAlign: "left", color: isPeak ? C.warn : C.t2, fontWeight: isPeak ? 600 : 400, borderRight: `1px solid ${C.brd}44` }}>{TB[t].lbl}</td>
+                          <td style={{ ...tdS, color: C.t1, fontWeight: 600, borderRight: `1px solid ${C.brd}44` }}>{Math.round(b.dem || 0)}</td>
+                          <td style={{ ...tdS, color: C.pos }}>{Math.round(b.gen || 0)}</td>
+                          <td style={{ ...tdS, color: C.t2 }}>{Math.round(b.fdreMW || 0) || "—"}</td>
+                          <td style={{ ...tdS, color: C.bilat, borderRight: `1px solid ${C.brd}44` }}>{Math.round(b.stoaBuy || 0) || "—"}</td>
+                          <td style={{ ...tdS, color: C.focus }}>{Math.round(b.mktDAM || 0)}</td>
+                          <td style={{ ...tdS, color: C.t2 }}>{Math.round(b.mktGDAM || 0) || "—"}</td>
+                          <td style={{ ...tdS, color: C.t2, borderRight: `1px solid ${C.brd}44` }}>{Math.round(b.mktRTM || 0)}</td>
+                          <td style={{ ...tdS, color: C.pos, fontWeight: 600, borderRight: `1px solid ${C.brd}44` }}>{Math.round(total)}</td>
+                          <td style={{ ...tdS, color: (b.sur || 0) > 0 ? C.bilat : C.t3 }}>{Math.round(b.sur || 0) || "—"}</td>
+                          <td style={{ ...tdS, color: (b.def || 0) > 0 ? C.neg : C.t3 }}>{Math.round(b.def || 0) || "—"}</td>
+                          <td style={{ ...tdS, color: (b.curtailment || 0) > 0 ? C.neg : C.t3 }}>{Math.round(b.curtailment || 0) || "—"}</td>
+                          <td style={{ ...tdS, fontWeight: 600, borderRight: `1px solid ${C.brd}44`,
+                            color: gap > 0 ? C.pos : gap < 0 ? C.neg : C.t2,
+                            background: gap < -50 ? C.neg + "12" : gap > 50 ? C.pos + "08" : "transparent",
+                          }}>{gap > 0 ? "+" : ""}{gap}</td>
+                          <td style={{ ...tdS, color: C.warn }}>{(b.cost || 0).toFixed(1)}</td>
+                        </tr>
+                      );
+                    })}</tbody>
+                  </table>
+                </div>
+              </Panel>
+            );
+          })()}
         </>
       )}
     </div>
@@ -4846,7 +5002,7 @@ export default function App() {
 
   // Track input changes → mark dirty
   const inputSig = useMemo(() => JSON.stringify([
-    plants.map(p => [p.id, p.pMax, p.pMin, p.ecr, p.avail, p.mustRun, p.corridor].join(",")),
+    plants.map(p => [p.id, p.pMax, p.pMin, p.ecr, p.avail, p.mustRun, p.corridor, p.manualSchedule, p.scheduleHours?.join(""), p.rampUp, p.rampDn].join(",")),
     demand, demandMU, stoa.map(s => [s.id, s.mw, s.rate, s.status, s.dir, s.corridor].join(",")),
     [mkt.damLim, mkt.gdamLim, mkt.rtmLim, mkt.rtmPrem, mkt.gnaQuantum, mkt.tgnaRate],
     mkt.damMCP, mkt.gdamMCP, mkt.bilatRate,
@@ -5526,7 +5682,7 @@ export default function App() {
         </span>
         <span style={{ ...mono, fontSize: 10, color: C.t2 }}>{R.mo} | Pk {R.pk}MW | Rs{R.agg.avgCost}/kWh</span>
         <span style={{ ...mono, fontSize: 10, color: C.pos }}>COMPUTED {computedAt}</span>
-        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT OUTLOOK v6.8 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
+        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT OUTLOOK v6.9 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
         <div style={{ width: 1, height: 12, background: C.brd }} />
         <span style={{ ...ui, fontSize: 9, color: C.t3 }}>Developed by <span style={{ color: C.focus, fontWeight: 600 }}>EMA Solutions Pvt. Ltd.</span> &copy; {new Date().getFullYear()} All rights reserved.</span>
       </div>
